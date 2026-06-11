@@ -1,0 +1,23 @@
+[project]
+name = "agent-coordinator"
+version = "0.1.0"
+description = "Durable task ownership, lease, heartbeat, and reclaim coordination for agent loops."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Boundless Studios" }]
+dependencies = []
+
+[project.scripts]
+agent-coordinator = "agent_coordinator.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
