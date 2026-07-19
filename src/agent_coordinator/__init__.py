@@ -1,7 +1,13 @@
 """Agent task ownership coordination library."""
 
 from .models import ClaimRecord, OwnerIdentity, TaskIdentity
-from .service import ClaimConflictError, ClaimDecision, ClaimState, TaskCoordinator
+from .service import (
+    ClaimConflictError,
+    ClaimDecision,
+    ClaimState,
+    StaleClaimError,
+    TaskCoordinator,
+)
 from .store import JsonlClaimStore
 
 __all__ = [
@@ -11,6 +17,7 @@ __all__ = [
     "ClaimState",
     "JsonlClaimStore",
     "OwnerIdentity",
+    "StaleClaimError",
     "TaskCoordinator",
     "TaskIdentity",
 ]

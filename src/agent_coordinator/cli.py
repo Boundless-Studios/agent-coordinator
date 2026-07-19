@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 from .models import OwnerIdentity, TaskIdentity
-from .service import ClaimConflictError, TaskCoordinator
+from .service import ClaimConflictError, StaleClaimError, TaskCoordinator
 from .store import JsonlClaimStore
 
 
@@ -50,21 +50,43 @@ def _cmd_claim(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
-    claim = _coordinator(args).heartbeat_claim(
-        args.claim_id,
-        owner_session_id=args.session_id,
-        lease_seconds=args.lease_seconds,
-    )
+    try:
+        claim = _coordinator(args).heartbeat_claim(
+            args.claim_id,
+            owner_session_id=args.session_id,
+            lease_epoch=args.lease_epoch,
+            lease_seconds=args.lease_seconds,
+        )
+    except StaleClaimError as exc:
+        _print(
+            {
+                "error": "stale_lease_epoch",
+                "expected_epoch": exc.expected_epoch,
+                "received_epoch": exc.received_epoch,
+            }
+        )
+        return 4
     _print({"state": "active", "claim": claim.to_dict()})
     return 0
 
 
 def _cmd_release(args: argparse.Namespace) -> int:
-    claim = _coordinator(args).release_claim(
-        args.claim_id,
-        owner_session_id=args.session_id,
-        reason=args.reason,
-    )
+    try:
+        claim = _coordinator(args).release_claim(
+            args.claim_id,
+            owner_session_id=args.session_id,
+            lease_epoch=args.lease_epoch,
+            reason=args.reason,
+        )
+    except StaleClaimError as exc:
+        _print(
+            {
+                "error": "stale_lease_epoch",
+                "expected_epoch": exc.expected_epoch,
+                "received_epoch": exc.received_epoch,
+            }
+        )
+        return 4
     _print({"state": "released", "claim": claim.to_dict()})
     return 0
 
@@ -111,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_store_arg(heartbeat)
     heartbeat.add_argument("--claim-id", required=True)
     heartbeat.add_argument("--session-id", required=True)
+    heartbeat.add_argument("--lease-epoch", type=int, required=True)
     heartbeat.add_argument("--lease-seconds", type=int, default=900)
     heartbeat.set_defaults(func=_cmd_heartbeat)
 
@@ -118,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_store_arg(release)
     release.add_argument("--claim-id", required=True)
     release.add_argument("--session-id", required=True)
+    release.add_argument("--lease-epoch", type=int, required=True)
     release.add_argument("--reason", default="released")
     release.set_defaults(func=_cmd_release)
 

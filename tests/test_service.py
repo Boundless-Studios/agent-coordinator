@@ -5,7 +5,8 @@ import threading
 
 import pytest
 
-from agent_coordinator.models import OwnerIdentity, TaskIdentity
+import agent_coordinator
+from agent_coordinator.models import ClaimRecord, OwnerIdentity, TaskIdentity
 from agent_coordinator import service as coordinator_service
 from agent_coordinator.service import ClaimConflictError, ClaimState, TaskCoordinator
 from agent_coordinator.store import JsonlClaimStore
@@ -188,6 +189,10 @@ def test_stale_epoch_cannot_heartbeat_or_release_successor_claim(tmp_path):
         )
 
 
+def test_stale_claim_error_is_part_of_public_api():
+    assert agent_coordinator.StaleClaimError is coordinator_service.StaleClaimError
+
+
 def test_legacy_claim_event_without_epoch_decodes_as_zero(tmp_path):
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
     legacy_claim = {
@@ -216,6 +221,19 @@ def test_legacy_claim_event_without_epoch_decodes_as_zero(tmp_path):
 
     assert status.claim is not None
     assert status.claim.lease_epoch == 0
+
+
+def test_claim_record_rejects_negative_lease_epoch():
+    with pytest.raises(ValueError, match="lease_epoch must be non-negative"):
+        ClaimRecord(
+            claim_id="invalid",
+            task=task(),
+            owner=owner(),
+            claimed_at=BASE_TIME,
+            heartbeat_at=BASE_TIME,
+            lease_expires_at=BASE_TIME + timedelta(seconds=60),
+            lease_epoch=-1,
+        )
 
 
 @pytest.mark.parametrize("reclaim_reason", ["expired", "owner_dead", "released"])
@@ -257,10 +275,11 @@ def test_concurrent_claim_race_has_exactly_one_active_owner(tmp_path):
                 barrier.wait(timeout=5)
             return events
 
-    store = BarrierStore(tmp_path / "claims.jsonl")
+    store_path = tmp_path / "claims.jsonl"
+    stores = [BarrierStore(store_path), BarrierStore(store_path)]
     coordinators = [
-        TaskCoordinator(store, pid_is_live=lambda _pid: True),
-        TaskCoordinator(store, pid_is_live=lambda _pid: True),
+        TaskCoordinator(store, pid_is_live=lambda _pid: True)
+        for store in stores
     ]
     outcomes: list[object] = []
 
@@ -288,7 +307,7 @@ def test_concurrent_claim_race_has_exactly_one_active_owner(tmp_path):
     successes = [result for result in outcomes if not isinstance(result, Exception)]
     conflicts = [result for result in outcomes if isinstance(result, ClaimConflictError)]
     claimed_events = [
-        event for event in store.read_events() if event.get("event") == "claimed"
+        event for event in stores[0].read_events() if event.get("event") == "claimed"
     ]
 
     assert len(successes) == 1
