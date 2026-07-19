@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 @contextmanager
@@ -43,22 +43,40 @@ class JsonlClaimStore:
 
     def append_event(self, event: dict[str, Any]) -> None:
         with _exclusive_lock(self.lock_path):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, sort_keys=True) + "\n")
+            self._append_event_unlocked(event)
 
     def read_events(self) -> list[dict[str, Any]]:
         with _exclusive_lock(self.lock_path):
-            if not self.path.exists():
-                return []
-            events: list[dict[str, Any]] = []
-            for line in self.path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(payload, dict):
-                    events.append(payload)
-            return events
+            return self._read_events_unlocked()
+
+    def transact_event(
+        self,
+        build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        with _exclusive_lock(self.lock_path):
+            events = self._read_events_unlocked()
+            event = build_event(events)
+            self._append_event_unlocked(event)
+            return event
+
+    def _append_event_unlocked(self, event: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _read_events_unlocked(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events

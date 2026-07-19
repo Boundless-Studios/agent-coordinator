@@ -86,8 +86,13 @@ class ClaimRecord:
     claimed_at: datetime
     heartbeat_at: datetime
     lease_expires_at: datetime
+    lease_epoch: int = 0
     status: str = "active"
     release_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.lease_epoch < 0:
+            raise ValueError("lease_epoch must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +102,7 @@ class ClaimRecord:
             "claimed_at": datetime_to_json(self.claimed_at),
             "heartbeat_at": datetime_to_json(self.heartbeat_at),
             "lease_expires_at": datetime_to_json(self.lease_expires_at),
+            "lease_epoch": self.lease_epoch,
             "status": self.status,
             "release_reason": self.release_reason,
         }
@@ -110,6 +116,7 @@ class ClaimRecord:
             claimed_at=datetime_from_json(str(payload["claimed_at"])),
             heartbeat_at=datetime_from_json(str(payload["heartbeat_at"])),
             lease_expires_at=datetime_from_json(str(payload["lease_expires_at"])),
+            lease_epoch=int(payload.get("lease_epoch", 0)),
             status=str(payload.get("status") or "active"),
             release_reason=payload.get("release_reason"),
         )

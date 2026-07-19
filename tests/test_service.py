@@ -295,3 +295,35 @@ def test_concurrent_claim_race_has_exactly_one_active_owner(tmp_path):
     assert len(conflicts) == 1
     assert len(claimed_events) == 1
     assert claimed_events[0]["claim"]["lease_epoch"] == 1
+
+
+def test_store_transaction_sees_prior_events_and_appends_once(tmp_path):
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    store.append_event({"event": "seed", "value": 1})
+    observed: list[dict] = []
+
+    def build_event(events):
+        observed.extend(events)
+        return {"event": "next", "value": len(events) + 1}
+
+    appended = store.transact_event(build_event)
+
+    assert observed == [{"event": "seed", "value": 1}]
+    assert appended == {"event": "next", "value": 2}
+    assert store.read_events() == [
+        {"event": "seed", "value": 1},
+        {"event": "next", "value": 2},
+    ]
+
+
+def test_store_transaction_builder_exception_appends_nothing(tmp_path):
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    store.append_event({"event": "seed"})
+
+    def fail_builder(_events):
+        raise RuntimeError("decision failed")
+
+    with pytest.raises(RuntimeError, match="decision failed"):
+        store.transact_event(fail_builder)
+
+    assert store.read_events() == [{"event": "seed"}]
