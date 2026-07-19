@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import os
+from typing import Any
 import uuid
 
 from .models import ClaimRecord, OwnerIdentity, TaskIdentity, datetime_from_json, datetime_to_json
@@ -42,6 +43,15 @@ class ClaimConflictError(RuntimeError):
         super().__init__(decision.reason)
 
 
+class StaleClaimError(RuntimeError):
+    def __init__(self, *, expected_epoch: int, received_epoch: int):
+        self.expected_epoch = expected_epoch
+        self.received_epoch = received_epoch
+        super().__init__(
+            f"stale lease epoch: expected {expected_epoch}, received {received_epoch}"
+        )
+
+
 def default_pid_is_live(pid: int | None) -> bool:
     if pid is None or pid <= 0:
         return True
@@ -75,70 +85,108 @@ class TaskCoordinator:
         now: datetime | None = None,
     ) -> ClaimRecord:
         timestamp = now or self._now()
-        current = self.status(task, now=timestamp)
-        if current.state is ClaimState.ACTIVE and current.claim is not None:
-            if current.claim.owner.session_id != owner.session_id:
-                raise ClaimConflictError(current)
-            return self.heartbeat_claim(
-                current.claim.claim_id,
-                owner_session_id=owner.session_id,
-                lease_seconds=lease_seconds,
-                now=timestamp,
-            )
+        result: ClaimRecord | None = None
 
-        claim = ClaimRecord(
-            claim_id=uuid.uuid4().hex,
-            task=task,
-            owner=owner,
-            claimed_at=timestamp,
-            heartbeat_at=timestamp,
-            lease_expires_at=timestamp + timedelta(seconds=lease_seconds),
-        )
-        self.store.append_event(
-            {
+        def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal result
+            claims = self._claims_by_id(events)
+            current = self._decision_for_task(task, claims, timestamp)
+            if current.state is ClaimState.ACTIVE and current.claim is not None:
+                if current.claim.owner.session_id != owner.session_id:
+                    raise ClaimConflictError(current)
+                result = ClaimRecord(
+                    claim_id=current.claim.claim_id,
+                    task=current.claim.task,
+                    owner=current.claim.owner,
+                    claimed_at=current.claim.claimed_at,
+                    heartbeat_at=timestamp,
+                    lease_expires_at=timestamp + timedelta(seconds=lease_seconds),
+                    lease_epoch=current.claim.lease_epoch,
+                    status="active",
+                )
+                return {
+                    "event": "heartbeat",
+                    "timestamp": datetime_to_json(timestamp),
+                    "claim_id": result.claim_id,
+                    "owner_session_id": owner.session_id,
+                    "lease_epoch": result.lease_epoch,
+                    "heartbeat_at": datetime_to_json(result.heartbeat_at),
+                    "lease_expires_at": datetime_to_json(result.lease_expires_at),
+                }
+
+            result = ClaimRecord(
+                claim_id=uuid.uuid4().hex,
+                task=task,
+                owner=owner,
+                claimed_at=timestamp,
+                heartbeat_at=timestamp,
+                lease_expires_at=timestamp + timedelta(seconds=lease_seconds),
+                lease_epoch=max(
+                    (claim.lease_epoch for claim in claims.values()), default=0
+                )
+                + 1,
+            )
+            return {
                 "event": "claimed",
                 "timestamp": datetime_to_json(timestamp),
-                "claim": claim.to_dict(),
+                "claim": result.to_dict(),
             }
-        )
-        return claim
+
+        self.store.transact_event(build_event)
+        if result is None:
+            raise RuntimeError("claim transaction did not produce a claim")
+        return result
 
     def heartbeat_claim(
         self,
         claim_id: str,
         *,
         owner_session_id: str,
+        lease_epoch: int,
         lease_seconds: int,
         now: datetime | None = None,
     ) -> ClaimRecord:
         timestamp = now or self._now()
-        claim = self._claim_by_id(claim_id)
-        if claim is None:
-            raise KeyError(f"unknown claim_id: {claim_id}")
-        if claim.owner.session_id != owner_session_id:
-            raise PermissionError("owner_session_id does not own claim")
-        if claim.status != "active":
-            raise ValueError("cannot heartbeat a released claim")
+        updated: ClaimRecord | None = None
 
-        updated = ClaimRecord(
-            claim_id=claim.claim_id,
-            task=claim.task,
-            owner=claim.owner,
-            claimed_at=claim.claimed_at,
-            heartbeat_at=timestamp,
-            lease_expires_at=timestamp + timedelta(seconds=lease_seconds),
-            status="active",
-        )
-        self.store.append_event(
-            {
+        def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal updated
+            claim = self._claims_by_id(events).get(claim_id)
+            if claim is None:
+                raise KeyError(f"unknown claim_id: {claim_id}")
+            if claim.owner.session_id != owner_session_id:
+                raise PermissionError("owner_session_id does not own claim")
+            if claim.lease_epoch != lease_epoch:
+                raise StaleClaimError(
+                    expected_epoch=claim.lease_epoch,
+                    received_epoch=lease_epoch,
+                )
+            if claim.status != "active":
+                raise ValueError("cannot heartbeat a released claim")
+
+            updated = ClaimRecord(
+                claim_id=claim.claim_id,
+                task=claim.task,
+                owner=claim.owner,
+                claimed_at=claim.claimed_at,
+                heartbeat_at=timestamp,
+                lease_expires_at=timestamp + timedelta(seconds=lease_seconds),
+                lease_epoch=claim.lease_epoch,
+                status="active",
+            )
+            return {
                 "event": "heartbeat",
                 "timestamp": datetime_to_json(timestamp),
                 "claim_id": claim_id,
                 "owner_session_id": owner_session_id,
+                "lease_epoch": updated.lease_epoch,
                 "heartbeat_at": datetime_to_json(updated.heartbeat_at),
                 "lease_expires_at": datetime_to_json(updated.lease_expires_at),
             }
-        )
+
+        self.store.transact_event(build_event)
+        if updated is None:
+            raise RuntimeError("heartbeat transaction did not produce a claim")
         return updated
 
     def release_claim(
@@ -146,41 +194,64 @@ class TaskCoordinator:
         claim_id: str,
         *,
         owner_session_id: str,
+        lease_epoch: int,
         reason: str = "released",
         now: datetime | None = None,
     ) -> ClaimRecord:
         timestamp = now or self._now()
-        claim = self._claim_by_id(claim_id)
-        if claim is None:
-            raise KeyError(f"unknown claim_id: {claim_id}")
-        if claim.owner.session_id != owner_session_id:
-            raise PermissionError("owner_session_id does not own claim")
+        released: ClaimRecord | None = None
 
-        released = ClaimRecord(
-            claim_id=claim.claim_id,
-            task=claim.task,
-            owner=claim.owner,
-            claimed_at=claim.claimed_at,
-            heartbeat_at=claim.heartbeat_at,
-            lease_expires_at=claim.lease_expires_at,
-            status=reason or "released",
-            release_reason=reason or "released",
-        )
-        self.store.append_event(
-            {
+        def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal released
+            claim = self._claims_by_id(events).get(claim_id)
+            if claim is None:
+                raise KeyError(f"unknown claim_id: {claim_id}")
+            if claim.owner.session_id != owner_session_id:
+                raise PermissionError("owner_session_id does not own claim")
+            if claim.lease_epoch != lease_epoch:
+                raise StaleClaimError(
+                    expected_epoch=claim.lease_epoch,
+                    received_epoch=lease_epoch,
+                )
+
+            release_reason = reason or "released"
+            released = ClaimRecord(
+                claim_id=claim.claim_id,
+                task=claim.task,
+                owner=claim.owner,
+                claimed_at=claim.claimed_at,
+                heartbeat_at=claim.heartbeat_at,
+                lease_expires_at=claim.lease_expires_at,
+                lease_epoch=claim.lease_epoch,
+                status=release_reason,
+                release_reason=release_reason,
+            )
+            return {
                 "event": "released",
                 "timestamp": datetime_to_json(timestamp),
                 "claim_id": claim_id,
                 "owner_session_id": owner_session_id,
+                "lease_epoch": released.lease_epoch,
                 "status": released.status,
                 "release_reason": released.release_reason,
             }
-        )
+
+        self.store.transact_event(build_event)
+        if released is None:
+            raise RuntimeError("release transaction did not produce a claim")
         return released
 
     def status(self, task: TaskIdentity, *, now: datetime | None = None) -> ClaimDecision:
         timestamp = now or self._now()
-        claim = self._latest_claim_for_task(task)
+        return self._decision_for_task(task, self._claims_by_id(), timestamp)
+
+    def _decision_for_task(
+        self,
+        task: TaskIdentity,
+        claims: dict[str, ClaimRecord],
+        timestamp: datetime,
+    ) -> ClaimDecision:
+        claim = self._latest_claim_for_task(task, claims)
         if claim is None:
             return ClaimDecision(ClaimState.NO_CLAIM, None, True, "no claim for task fingerprint")
         if claim.status != "active":
@@ -194,22 +265,36 @@ class TaskCoordinator:
     def reclaimable(self, task: TaskIdentity, *, now: datetime | None = None) -> bool:
         return self.status(task, now=now).reclaimable
 
-    def _latest_claim_for_task(self, task: TaskIdentity) -> ClaimRecord | None:
+    def _latest_claim_for_task(
+        self,
+        task: TaskIdentity,
+        claims_by_id: dict[str, ClaimRecord] | None = None,
+    ) -> ClaimRecord | None:
+        materialized = claims_by_id if claims_by_id is not None else self._claims_by_id()
         claims = [
             claim
-            for claim in self._claims_by_id().values()
+            for claim in materialized.values()
             if claim.task == task
         ]
         if not claims:
             return None
-        return max(claims, key=lambda item: (item.claimed_at, item.heartbeat_at, item.claim_id))
+        return max(
+            claims,
+            key=lambda item: (
+                item.lease_epoch,
+                item.claimed_at,
+                item.heartbeat_at,
+                item.claim_id,
+            ),
+        )
 
-    def _claim_by_id(self, claim_id: str) -> ClaimRecord | None:
-        return self._claims_by_id().get(claim_id)
-
-    def _claims_by_id(self) -> dict[str, ClaimRecord]:
+    def _claims_by_id(
+        self,
+        events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, ClaimRecord]:
         claims: dict[str, ClaimRecord] = {}
-        for event in self.store.read_events():
+        source_events = self.store.read_events() if events is None else events
+        for event in source_events:
             event_type = event.get("event")
             if event_type == "claimed":
                 claim = ClaimRecord.from_dict(dict(event["claim"]))
@@ -226,6 +311,7 @@ class TaskCoordinator:
                     claimed_at=claim.claimed_at,
                     heartbeat_at=datetime_from_json(str(event["heartbeat_at"])),
                     lease_expires_at=datetime_from_json(str(event["lease_expires_at"])),
+                    lease_epoch=claim.lease_epoch,
                     status="active",
                 )
             elif event_type == "released":
@@ -241,6 +327,7 @@ class TaskCoordinator:
                     claimed_at=claim.claimed_at,
                     heartbeat_at=claim.heartbeat_at,
                     lease_expires_at=claim.lease_expires_at,
+                    lease_epoch=claim.lease_epoch,
                     status=reason,
                     release_reason=reason,
                 )
