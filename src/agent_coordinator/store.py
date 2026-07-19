@@ -15,10 +15,9 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
     with path.open("a+", encoding="utf-8") as handle:
         try:
             import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
+        except ImportError as exc:
+            raise RuntimeError("exclusive file locking is unavailable") from exc
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:

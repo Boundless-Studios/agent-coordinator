@@ -278,7 +278,15 @@ class TaskCoordinator:
         ]
         if not claims:
             return None
-        return max(claims, key=lambda item: (item.claimed_at, item.heartbeat_at, item.claim_id))
+        return max(
+            claims,
+            key=lambda item: (
+                item.lease_epoch,
+                item.claimed_at,
+                item.heartbeat_at,
+                item.claim_id,
+            ),
+        )
 
     def _claims_by_id(
         self,

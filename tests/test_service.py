@@ -265,6 +265,29 @@ def test_reclaim_allocates_higher_epoch(tmp_path, reclaim_reason):
     assert successor.lease_epoch > first.lease_epoch
 
 
+def test_higher_epoch_remains_current_when_timestamps_move_backward(tmp_path):
+    coord = coordinator(tmp_path)
+    first = coord.claim_task(task(), owner("s1", 101), lease_seconds=60, now=BASE_TIME)
+    coord.release_claim(
+        first.claim_id,
+        owner_session_id="s1",
+        lease_epoch=first.lease_epoch,
+        now=BASE_TIME + timedelta(seconds=1),
+    )
+    successor = coord.claim_task(
+        task(),
+        owner("s2", 202),
+        lease_seconds=60,
+        now=BASE_TIME - timedelta(seconds=1),
+    )
+
+    status = coord.status(task(), now=BASE_TIME + timedelta(seconds=2))
+
+    assert successor.lease_epoch == 2
+    assert status.state is ClaimState.ACTIVE
+    assert status.claim == successor
+
+
 def test_concurrent_claim_race_has_exactly_one_active_owner(tmp_path):
     barrier = threading.Barrier(2)
 
@@ -346,3 +369,19 @@ def test_store_transaction_builder_exception_appends_nothing(tmp_path):
         store.transact_event(fail_builder)
 
     assert store.read_events() == [{"event": "seed"}]
+
+
+def test_store_transaction_aborts_when_file_lock_fails(tmp_path, monkeypatch):
+    import fcntl
+
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    def fail_lock(_file_descriptor, _operation):
+        raise OSError("lock unavailable")
+
+    monkeypatch.setattr(fcntl, "flock", fail_lock)
+
+    with pytest.raises(OSError, match="lock unavailable"):
+        store.transact_event(lambda _events: {"event": "must-not-append"})
+
+    assert not store.path.exists()
