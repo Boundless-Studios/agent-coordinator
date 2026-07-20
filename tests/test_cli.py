@@ -189,4 +189,77 @@ def test_cli_rejects_stale_lease_epoch_for_mutations(tmp_path, capsys):
             "error": "stale_lease_epoch",
             "expected_epoch": second_claim["lease_epoch"],
             "received_epoch": first_claim["lease_epoch"],
+            "current_claim_id": second_claim["claim_id"],
         }
+
+
+def test_cli_rejects_deposed_owner_mutations_on_its_own_claim(tmp_path, capsys):
+    """BOU-2209: an owner deposed after a lease expiry must not re-arm itself."""
+    store = tmp_path / "claims.jsonl"
+    common = [
+        "--store",
+        str(store),
+        "--type",
+        "pr-maintenance",
+        "--id",
+        "github:Boundless-Studios/agentic-pr-dash#8",
+        "--fingerprint",
+        "comments:a",
+    ]
+
+    def claim_as(session_id: str, lease_seconds: int) -> dict:
+        code, payload = run_cli(
+            [
+                "claim",
+                *common,
+                "--session-id",
+                session_id,
+                "--pid",
+                "0",
+                "--agent",
+                "codex",
+                "--worktree-path",
+                "/tmp/worktree",
+                "--lease-seconds",
+                str(lease_seconds),
+            ],
+            capsys,
+        )
+        assert code == 0
+        return payload["claim"]
+
+    # A takes a lease so short it is already expired by the time B claims.
+    first_claim = claim_as("s1", 0)
+    second_claim = claim_as("s2", 600)
+    assert second_claim["lease_epoch"] > first_claim["lease_epoch"]
+    assert second_claim["claim_id"] != first_claim["claim_id"]
+
+    # A resumes and tries to mutate *its own* claim id at *its own* epoch.
+    for command in ("heartbeat", "release"):
+        args = [
+            command,
+            "--store",
+            str(store),
+            "--claim-id",
+            first_claim["claim_id"],
+            "--session-id",
+            "s1",
+            "--lease-epoch",
+            str(first_claim["lease_epoch"]),
+        ]
+        if command == "heartbeat":
+            args.extend(["--lease-seconds", "600"])
+        code, stale = run_cli(args, capsys)
+        assert code == 4
+        assert stale == {
+            "error": "stale_lease_epoch",
+            "expected_epoch": second_claim["lease_epoch"],
+            "received_epoch": first_claim["lease_epoch"],
+            "current_claim_id": second_claim["claim_id"],
+        }
+
+    # B is still the sole owner.
+    code, status = run_cli(["status", *common], capsys)
+    assert code == 0
+    assert status["state"] == "active"
+    assert status["claim"]["claim_id"] == second_claim["claim_id"]
