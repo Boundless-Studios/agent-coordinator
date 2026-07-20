@@ -42,3 +42,26 @@ claim.
 
 Epoch `0` exists only to read events written by versions before `0.2.0`; the
 coordinator never allocates it to a new claim.
+
+## Fencing a deposed owner
+
+The fence is evaluated against **the task's current epoch**, not against the
+caller's own claim record, and it runs *inside* the same store transaction as
+the write. That closes the window where a stalled owner (swap, `SIGSTOP`, a
+long adapter call) resumes after its lease expired, heartbeats its own claim
+id at its own epoch, and quietly extends a lease that a successor already took
+over — two live owners on one task.
+
+Concretely: when a successor claims a task, the same transaction that mints
+epoch *N+1* also marks every still-active predecessor claim for that task
+`superseded`, so a stale claim id cannot be resurrected at all. A deposed
+owner's `heartbeat` and `release` both fail with `StaleClaimError`, which
+carries `expected_epoch`, `received_epoch`, and `current_claim_id` — enough for
+the loser to learn it was deposed and by whom. The CLI reports the same three
+fields alongside `"error": "stale_lease_epoch"`.
+
+Consumers should treat `StaleClaimError` as authoritative rather than
+pre-checking with `status()` and then mutating: a separate read transaction
+followed by a write transaction is a TOCTOU gap, and any pause between the two
+lets a stale owner re-arm. The in-transaction fence is what makes the mutation
+safe.

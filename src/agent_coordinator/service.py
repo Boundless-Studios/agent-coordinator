@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import os
@@ -11,6 +11,9 @@ import uuid
 
 from .models import ClaimRecord, OwnerIdentity, TaskIdentity, datetime_from_json, datetime_to_json
 from .store import JsonlClaimStore
+
+
+SUPERSEDED_STATUS = "superseded"
 
 
 class ClaimState(str, Enum):
@@ -44,9 +47,22 @@ class ClaimConflictError(RuntimeError):
 
 
 class StaleClaimError(RuntimeError):
-    def __init__(self, *, expected_epoch: int, received_epoch: int):
+    """Raised when a caller's lease epoch is not the task's current epoch.
+
+    ``current_claim_id`` names the claim that currently owns the task, so a
+    deposed owner can learn *who* deposed it instead of only that it lost.
+    """
+
+    def __init__(
+        self,
+        *,
+        expected_epoch: int,
+        received_epoch: int,
+        current_claim_id: str | None = None,
+    ):
         self.expected_epoch = expected_epoch
         self.received_epoch = received_epoch
+        self.current_claim_id = current_claim_id
         super().__init__(
             f"stale lease epoch: expected {expected_epoch}, received {received_epoch}"
         )
@@ -126,11 +142,22 @@ class TaskCoordinator:
                 )
                 + 1,
             )
-            return {
+            event: dict[str, Any] = {
                 "event": "claimed",
                 "timestamp": datetime_to_json(timestamp),
                 "claim": result.to_dict(),
             }
+            # Retire every still-active predecessor for this task in the same
+            # transaction that mints the successor, so a stale claim id cannot
+            # be resurrected by a resumed owner.
+            superseded = sorted(
+                existing.claim_id
+                for existing in claims.values()
+                if existing.task == task and existing.status == "active"
+            )
+            if superseded:
+                event["superseded_claim_ids"] = superseded
+            return event
 
         self.store.transact_event(build_event)
         if result is None:
@@ -151,16 +178,13 @@ class TaskCoordinator:
 
         def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal updated
-            claim = self._claims_by_id(events).get(claim_id)
+            claims = self._claims_by_id(events)
+            claim = claims.get(claim_id)
             if claim is None:
                 raise KeyError(f"unknown claim_id: {claim_id}")
             if claim.owner.session_id != owner_session_id:
                 raise PermissionError("owner_session_id does not own claim")
-            if claim.lease_epoch != lease_epoch:
-                raise StaleClaimError(
-                    expected_epoch=claim.lease_epoch,
-                    received_epoch=lease_epoch,
-                )
+            self._assert_epoch_is_current(claim, claims, lease_epoch)
             if claim.status != "active":
                 raise ValueError("cannot heartbeat a released claim")
 
@@ -203,16 +227,13 @@ class TaskCoordinator:
 
         def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal released
-            claim = self._claims_by_id(events).get(claim_id)
+            claims = self._claims_by_id(events)
+            claim = claims.get(claim_id)
             if claim is None:
                 raise KeyError(f"unknown claim_id: {claim_id}")
             if claim.owner.session_id != owner_session_id:
                 raise PermissionError("owner_session_id does not own claim")
-            if claim.lease_epoch != lease_epoch:
-                raise StaleClaimError(
-                    expected_epoch=claim.lease_epoch,
-                    received_epoch=lease_epoch,
-                )
+            self._assert_epoch_is_current(claim, claims, lease_epoch)
 
             release_reason = reason or "released"
             released = ClaimRecord(
@@ -244,6 +265,41 @@ class TaskCoordinator:
     def status(self, task: TaskIdentity, *, now: datetime | None = None) -> ClaimDecision:
         timestamp = now or self._now()
         return self._decision_for_task(task, self._claims_by_id(), timestamp)
+
+    def claim_by_id(self, claim_id: str) -> ClaimRecord | None:
+        """Return the materialized record for ``claim_id``, if the ledger has one.
+
+        A deposed owner can use this to learn that its own claim was superseded.
+        """
+        return self._claims_by_id().get(claim_id)
+
+    def _assert_epoch_is_current(
+        self,
+        claim: ClaimRecord,
+        claims: dict[str, ClaimRecord],
+        lease_epoch: int,
+    ) -> None:
+        """Fence ``lease_epoch`` against the task's current epoch.
+
+        Comparing against the claim's *own* epoch is not a fence: a deposed
+        owner still knows its own epoch. The only safe comparison is against
+        the highest epoch recorded for the task, and it must happen inside the
+        store transaction that performs the write.
+        """
+        current = self._latest_claim_for_task(claim.task, claims)
+        if (
+            current is not None
+            and current.claim_id == claim.claim_id
+            and current.lease_epoch == lease_epoch
+            and claim.lease_epoch == lease_epoch
+        ):
+            return
+        expected = current.lease_epoch if current is not None else claim.lease_epoch
+        raise StaleClaimError(
+            expected_epoch=expected,
+            received_epoch=lease_epoch,
+            current_claim_id=current.claim_id if current is not None else None,
+        )
 
     def _decision_for_task(
         self,
@@ -298,6 +354,15 @@ class TaskCoordinator:
             event_type = event.get("event")
             if event_type == "claimed":
                 claim = ClaimRecord.from_dict(dict(event["claim"]))
+                for superseded_id in event.get("superseded_claim_ids") or []:
+                    prior = claims.get(str(superseded_id))
+                    if prior is None or prior.status != "active":
+                        continue
+                    claims[prior.claim_id] = replace(
+                        prior,
+                        status=SUPERSEDED_STATUS,
+                        release_reason=SUPERSEDED_STATUS,
+                    )
                 claims[claim.claim_id] = claim
             elif event_type == "heartbeat":
                 claim_id = str(event.get("claim_id") or "")

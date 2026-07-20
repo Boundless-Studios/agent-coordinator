@@ -49,6 +49,15 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stale_payload(exc: StaleClaimError) -> dict[str, object]:
+    return {
+        "error": "stale_lease_epoch",
+        "expected_epoch": exc.expected_epoch,
+        "received_epoch": exc.received_epoch,
+        "current_claim_id": exc.current_claim_id,
+    }
+
+
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     try:
         claim = _coordinator(args).heartbeat_claim(
@@ -58,13 +67,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             lease_seconds=args.lease_seconds,
         )
     except StaleClaimError as exc:
-        _print(
-            {
-                "error": "stale_lease_epoch",
-                "expected_epoch": exc.expected_epoch,
-                "received_epoch": exc.received_epoch,
-            }
-        )
+        _print(_stale_payload(exc))
         return 4
     _print({"state": "active", "claim": claim.to_dict()})
     return 0
@@ -79,13 +82,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
             reason=args.reason,
         )
     except StaleClaimError as exc:
-        _print(
-            {
-                "error": "stale_lease_epoch",
-                "expected_epoch": exc.expected_epoch,
-                "received_epoch": exc.received_epoch,
-            }
-        )
+        _print(_stale_payload(exc))
         return 4
     _print({"state": "released", "claim": claim.to_dict()})
     return 0
