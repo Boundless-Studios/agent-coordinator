@@ -6,7 +6,11 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Iterator
+import tempfile
+from typing import Any, Callable, Iterator, Optional
+
+
+EventCompactor = Callable[[list[dict[str, Any]]], Optional[list[dict[str, Any]]]]
 
 
 @contextmanager
@@ -51,11 +55,21 @@ class JsonlClaimStore:
     def transact_event(
         self,
         build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
+        *,
+        compact_events: EventCompactor | None = None,
     ) -> dict[str, Any]:
         with _exclusive_lock(self.lock_path):
             events = self._read_events_unlocked()
             event = build_event(events)
-            self._append_event_unlocked(event)
+            if compact_events is None:
+                self._append_event_unlocked(event)
+                return event
+
+            compacted = compact_events([*events, event])
+            if compacted is None:
+                self._append_event_unlocked(event)
+            else:
+                self._replace_events_unlocked(compacted)
             return event
 
     def _append_event_unlocked(self, event: dict[str, Any]) -> None:
@@ -64,6 +78,29 @@ class JsonlClaimStore:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+
+    def _replace_events_unlocked(self, events: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=self.path.parent,
+        )
+        temporary = Path(temporary_path)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                for event in events:
+                    handle.write(json.dumps(event, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            directory_descriptor = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _read_events_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
