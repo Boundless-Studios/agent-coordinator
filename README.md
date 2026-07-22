@@ -65,3 +65,18 @@ pre-checking with `status()` and then mutating: a separate read transaction
 followed by a write transaction is a TOCTOU gap, and any pause between the two
 lets a stale owner re-arm. The in-transaction fence is what makes the mutation
 safe.
+
+## Bounded claim history
+
+The coordinator compacts `claims.jsonl` after 1,000 new events by default.
+Compaction preserves every live claim and seven days of released, superseded,
+or expired claim history. It also preserves the global lease-epoch watermark,
+so pruning an old claim cannot let a future epoch move backward.
+
+The compacted log is written to a same-directory temporary file, flushed, and
+atomically replaced while the existing store lock is held. Callers do not need
+to coordinate compaction or change how they construct `JsonlClaimStore` and
+`TaskCoordinator`.
+
+Tests and specialized deployments can tune the bounds through
+`TaskCoordinator(compaction_event_threshold=..., claim_history_retention=...)`.

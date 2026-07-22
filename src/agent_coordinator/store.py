@@ -6,7 +6,21 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Iterator
+import shutil
+import stat
+import tempfile
+from typing import Any, Callable, Iterator, Optional
+
+
+EventCompactor = Callable[[list[dict[str, Any]]], Optional[list[dict[str, Any]]]]
+
+
+def _copy_extended_attributes(source: Path, destination: Path) -> None:
+    """Best-effort copy of ACLs and other extended inode metadata."""
+    try:
+        shutil.copystat(source, destination)
+    except OSError:
+        pass
 
 
 @contextmanager
@@ -38,7 +52,8 @@ class JsonlClaimStore:
 
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
-        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        resolved_path = self.path.resolve()
+        self.lock_path = resolved_path.with_suffix(resolved_path.suffix + ".lock")
 
     def append_event(self, event: dict[str, Any]) -> None:
         with _exclusive_lock(self.lock_path):
@@ -48,14 +63,28 @@ class JsonlClaimStore:
         with _exclusive_lock(self.lock_path):
             return self._read_events_unlocked()
 
+    def supports_atomic_compaction(self) -> bool:
+        """Return whether ``transact_event`` accepts a compaction callback."""
+        return type(self).transact_event is JsonlClaimStore.transact_event
+
     def transact_event(
         self,
         build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
+        *,
+        compact_events: EventCompactor | None = None,
     ) -> dict[str, Any]:
         with _exclusive_lock(self.lock_path):
             events = self._read_events_unlocked()
             event = build_event(events)
-            self._append_event_unlocked(event)
+            if compact_events is None:
+                self._append_event_unlocked(event)
+                return event
+
+            compacted = compact_events([*events, event])
+            if compacted is None:
+                self._append_event_unlocked(event)
+            else:
+                self._replace_events_unlocked(compacted)
             return event
 
     def _append_event_unlocked(self, event: dict[str, Any]) -> None:
@@ -64,6 +93,43 @@ class JsonlClaimStore:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+
+    def _replace_events_unlocked(self, events: list[dict[str, Any]]) -> None:
+        replacement_path = self.path.resolve() if self.path.is_symlink() else self.path
+        replacement_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_metadata = replacement_path.stat() if replacement_path.exists() else None
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{replacement_path.name}.",
+            suffix=".tmp",
+            dir=replacement_path.parent,
+        )
+        temporary = Path(temporary_path)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                if existing_metadata is not None:
+                    try:
+                        os.fchown(
+                            handle.fileno(),
+                            existing_metadata.st_uid,
+                            existing_metadata.st_gid,
+                        )
+                    except PermissionError:
+                        pass
+                    os.fchmod(handle.fileno(), stat.S_IMODE(existing_metadata.st_mode))
+                for event in events:
+                    handle.write(json.dumps(event, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            if existing_metadata is not None:
+                _copy_extended_attributes(replacement_path, temporary)
+            os.replace(temporary, replacement_path)
+            directory_descriptor = os.open(replacement_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _read_events_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():

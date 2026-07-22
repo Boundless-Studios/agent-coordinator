@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import os
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 from .models import ClaimRecord, OwnerIdentity, TaskIdentity, datetime_from_json, datetime_to_json
@@ -14,6 +14,8 @@ from .store import JsonlClaimStore
 
 
 SUPERSEDED_STATUS = "superseded"
+DEFAULT_COMPACTION_EVENT_THRESHOLD = 1_000
+DEFAULT_CLAIM_HISTORY_RETENTION = timedelta(days=7)
 
 
 class ClaimState(str, Enum):
@@ -88,9 +90,17 @@ class TaskCoordinator:
         store: JsonlClaimStore,
         *,
         pid_is_live=default_pid_is_live,
+        compaction_event_threshold: int = DEFAULT_COMPACTION_EVENT_THRESHOLD,
+        claim_history_retention: timedelta = DEFAULT_CLAIM_HISTORY_RETENTION,
     ):
+        if compaction_event_threshold < 1:
+            raise ValueError("compaction_event_threshold must be positive")
+        if claim_history_retention < timedelta(0):
+            raise ValueError("claim_history_retention must not be negative")
         self.store = store
         self.pid_is_live = pid_is_live
+        self.compaction_event_threshold = compaction_event_threshold
+        self.claim_history_retention = claim_history_retention
 
     def claim_task(
         self,
@@ -137,10 +147,7 @@ class TaskCoordinator:
                 claimed_at=timestamp,
                 heartbeat_at=timestamp,
                 lease_expires_at=timestamp + timedelta(seconds=lease_seconds),
-                lease_epoch=max(
-                    (claim.lease_epoch for claim in claims.values()), default=0
-                )
-                + 1,
+                lease_epoch=self._max_lease_epoch(events, claims) + 1,
             )
             event: dict[str, Any] = {
                 "event": "claimed",
@@ -159,7 +166,7 @@ class TaskCoordinator:
                 event["superseded_claim_ids"] = superseded
             return event
 
-        self.store.transact_event(build_event)
+        self._transact_event(build_event, timestamp)
         if result is None:
             raise RuntimeError("claim transaction did not produce a claim")
         return result
@@ -208,7 +215,7 @@ class TaskCoordinator:
                 "lease_expires_at": datetime_to_json(updated.lease_expires_at),
             }
 
-        self.store.transact_event(build_event)
+        self._transact_event(build_event, timestamp)
         if updated is None:
             raise RuntimeError("heartbeat transaction did not produce a claim")
         return updated
@@ -257,7 +264,7 @@ class TaskCoordinator:
                 "release_reason": released.release_reason,
             }
 
-        self.store.transact_event(build_event)
+        self._transact_event(build_event, timestamp)
         if released is None:
             raise RuntimeError("release transaction did not produce a claim")
         return released
@@ -342,6 +349,116 @@ class TaskCoordinator:
                 item.heartbeat_at,
                 item.claim_id,
             ),
+        )
+
+    def _transact_event(
+        self,
+        build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
+        timestamp: datetime,
+    ) -> dict[str, Any]:
+        if not self.store.supports_atomic_compaction():
+            return self.store.transact_event(build_event)
+        return self.store.transact_event(
+            build_event,
+            compact_events=lambda events: self._compact_events(events, timestamp),
+        )
+
+    def _compact_events(
+        self,
+        events: list[dict[str, Any]],
+        timestamp: datetime,
+    ) -> list[dict[str, Any]] | None:
+        last_compaction = max(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("event") == "compaction"
+            ),
+            default=-1,
+        )
+        events_since_compaction = len(events) - last_compaction - 1
+        if events_since_compaction < self.compaction_event_threshold:
+            return None
+
+        claims = self._claims_by_id(events)
+        activity_by_claim = self._activity_by_claim(events)
+        cutoff = timestamp - self.claim_history_retention
+        snapshots = [
+            event
+            for event in events
+            if isinstance(event.get("event"), str)
+            and event.get("event")
+            not in {"claimed", "heartbeat", "released", "compaction"}
+        ]
+        for claim in sorted(claims.values(), key=lambda item: item.claim_id):
+            activity = activity_by_claim.get(claim.claim_id, claim.heartbeat_at)
+            if claim.status == "active" and claim.lease_expires_at <= timestamp:
+                activity = max(activity, claim.lease_expires_at)
+            if (
+                claim.status != "active" or claim.lease_expires_at <= timestamp
+            ) and activity < cutoff:
+                continue
+            snapshots.append(
+                {
+                    "event": "claimed",
+                    "timestamp": datetime_to_json(activity),
+                    "claim": claim.to_dict(),
+                    "compacted_snapshot": True,
+                }
+            )
+
+        snapshots.append(
+            {
+                "event": "compaction",
+                "timestamp": datetime_to_json(timestamp),
+                "max_lease_epoch": self._max_lease_epoch(events, claims),
+            }
+        )
+        return snapshots
+
+    @staticmethod
+    def _activity_by_claim(events: list[dict[str, Any]]) -> dict[str, datetime]:
+        activity: dict[str, datetime] = {}
+        for event in events:
+            raw_timestamp = event.get("timestamp")
+            if not raw_timestamp:
+                continue
+            try:
+                event_time = datetime_from_json(str(raw_timestamp))
+            except ValueError:
+                continue
+            claim_ids: list[str] = []
+            if event.get("event") == "claimed":
+                claim = event.get("claim")
+                if isinstance(claim, dict) and claim.get("claim_id"):
+                    claim_ids.append(str(claim["claim_id"]))
+                claim_ids.extend(
+                    str(claim_id)
+                    for claim_id in event.get("superseded_claim_ids") or []
+                )
+            elif event.get("event") in {"heartbeat", "released"}:
+                if event.get("claim_id"):
+                    claim_ids.append(str(event["claim_id"]))
+            for claim_id in claim_ids:
+                activity[claim_id] = max(
+                    activity.get(claim_id, event_time),
+                    event_time,
+                )
+        return activity
+
+    @staticmethod
+    def _max_lease_epoch(
+        events: list[dict[str, Any]],
+        claims: dict[str, ClaimRecord],
+    ) -> int:
+        compacted_epochs = (
+            int(event.get("max_lease_epoch") or 0)
+            for event in events
+            if event.get("event") == "compaction"
+        )
+        return max(
+            max((claim.lease_epoch for claim in claims.values()), default=0),
+            max(compacted_epochs, default=0),
         )
 
     def _claims_by_id(
