@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import stat
 
 import pytest
 
@@ -150,6 +151,20 @@ def test_failed_atomic_rewrite_leaves_original_log_unchanged(tmp_path, monkeypat
 
     assert store.path.read_bytes() == original
     assert list(tmp_path.glob(".claims.jsonl.*.tmp")) == []
+
+
+def test_compaction_preserves_existing_claims_log_permissions(tmp_path):
+    store_path = tmp_path / "claims.jsonl"
+    store = JsonlClaimStore(store_path)
+    store.append_event({"event": "existing"})
+    store_path.chmod(0o660)
+
+    store.transact_event(
+        lambda _events: {"event": "new"},
+        compact_events=lambda events: events,
+    )
+
+    assert stat.S_IMODE(store_path.stat().st_mode) == 0o660
 
 
 def test_legacy_store_override_keeps_working_without_compaction_keyword(tmp_path):

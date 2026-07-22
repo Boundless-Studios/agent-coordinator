@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 from typing import Any, Callable, Iterator, Optional
 
@@ -85,6 +86,7 @@ class JsonlClaimStore:
 
     def _replace_events_unlocked(self, events: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existing_metadata = self.path.stat() if self.path.exists() else None
         descriptor, temporary_path = tempfile.mkstemp(
             prefix=f".{self.path.name}.",
             suffix=".tmp",
@@ -93,6 +95,9 @@ class JsonlClaimStore:
         temporary = Path(temporary_path)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                if existing_metadata is not None:
+                    os.fchown(handle.fileno(), existing_metadata.st_uid, existing_metadata.st_gid)
+                    os.fchmod(handle.fileno(), stat.S_IMODE(existing_metadata.st_mode))
                 for event in events:
                     handle.write(json.dumps(event, sort_keys=True) + "\n")
                 handle.flush()
