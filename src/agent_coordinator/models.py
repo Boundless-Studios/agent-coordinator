@@ -7,17 +7,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-def datetime_to_json(value: datetime) -> str:
+def normalize_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return value.astimezone(timezone.utc)
+
+
+def datetime_to_json(value: datetime) -> str:
+    return normalize_datetime(value).isoformat().replace("+00:00", "Z")
 
 
 def datetime_from_json(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return normalize_datetime(parsed)
 
 
 @dataclass(frozen=True)

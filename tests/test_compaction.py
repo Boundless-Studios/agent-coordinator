@@ -300,6 +300,17 @@ def test_compaction_normalizes_naive_legacy_timestamps(tmp_path):
     )
 
 
+def test_public_now_normalizes_naive_timestamp_against_aware_claim(tmp_path):
+    coord = coordinator(tmp_path)
+    coord.claim_task(
+        task("mixed"), owner("mixed", 101), lease_seconds=60, now=BASE_TIME
+    )
+
+    decision = coord.status(task("mixed"), now=datetime(2026, 7, 20, 12, 0, 30))
+
+    assert decision.state is ClaimState.ACTIVE
+
+
 def test_compaction_copies_extended_metadata(tmp_path, monkeypatch):
     store_path = tmp_path / "claims.jsonl"
     store = JsonlClaimStore(store_path)
