@@ -51,7 +51,7 @@ class JsonlClaimStore:
     """
 
     def __init__(self, path: str | os.PathLike[str]):
-        self.path = Path(path)
+        self.path = Path(path).absolute()
         resolved_path = self.path.resolve()
         self.lock_path = resolved_path.with_suffix(resolved_path.suffix + ".lock")
 
@@ -84,7 +84,9 @@ class JsonlClaimStore:
             if compacted is None:
                 self._append_event_unlocked(event)
             else:
-                self._replace_events_unlocked(compacted)
+                replaced = self._replace_events_unlocked(compacted)
+                if not replaced:
+                    self._append_event_unlocked(event)
             return event
 
     def _append_event_unlocked(self, event: dict[str, Any]) -> None:
@@ -94,10 +96,12 @@ class JsonlClaimStore:
             handle.flush()
             os.fsync(handle.fileno())
 
-    def _replace_events_unlocked(self, events: list[dict[str, Any]]) -> None:
+    def _replace_events_unlocked(self, events: list[dict[str, Any]]) -> bool:
         replacement_path = self.path.resolve() if self.path.is_symlink() else self.path
         replacement_path.parent.mkdir(parents=True, exist_ok=True)
-        existing_metadata = replacement_path.stat() if replacement_path.exists() else None
+        existing_metadata = (
+            replacement_path.stat() if replacement_path.exists() else None
+        )
         descriptor, temporary_path = tempfile.mkstemp(
             prefix=f".{replacement_path.name}.",
             suffix=".tmp",
@@ -114,7 +118,13 @@ class JsonlClaimStore:
                             existing_metadata.st_gid,
                         )
                     except PermissionError:
-                        pass
+                        return False
+                    current_metadata = os.fstat(handle.fileno())
+                    if (
+                        current_metadata.st_uid != existing_metadata.st_uid
+                        or current_metadata.st_gid != existing_metadata.st_gid
+                    ):
+                        return False
                     os.fchmod(handle.fileno(), stat.S_IMODE(existing_metadata.st_mode))
                 for event in events:
                     handle.write(json.dumps(event, sort_keys=True) + "\n")
@@ -128,6 +138,7 @@ class JsonlClaimStore:
                 os.fsync(directory_descriptor)
             finally:
                 os.close(directory_descriptor)
+            return True
         finally:
             temporary.unlink(missing_ok=True)
 

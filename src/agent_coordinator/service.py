@@ -9,7 +9,14 @@ import os
 from typing import Any, Callable
 import uuid
 
-from .models import ClaimRecord, OwnerIdentity, TaskIdentity, datetime_from_json, datetime_to_json
+from .models import (
+    ClaimRecord,
+    OwnerIdentity,
+    TaskIdentity,
+    datetime_from_json,
+    datetime_to_json,
+    normalize_datetime,
+)
 from .store import JsonlClaimStore
 
 
@@ -110,7 +117,7 @@ class TaskCoordinator:
         lease_seconds: int,
         now: datetime | None = None,
     ) -> ClaimRecord:
-        timestamp = now or self._now()
+        timestamp = normalize_datetime(now or self._now())
         result: ClaimRecord | None = None
 
         def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -180,7 +187,7 @@ class TaskCoordinator:
         lease_seconds: int,
         now: datetime | None = None,
     ) -> ClaimRecord:
-        timestamp = now or self._now()
+        timestamp = normalize_datetime(now or self._now())
         updated: ClaimRecord | None = None
 
         def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -229,7 +236,7 @@ class TaskCoordinator:
         reason: str = "released",
         now: datetime | None = None,
     ) -> ClaimRecord:
-        timestamp = now or self._now()
+        timestamp = normalize_datetime(now or self._now())
         released: ClaimRecord | None = None
 
         def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -269,8 +276,10 @@ class TaskCoordinator:
             raise RuntimeError("release transaction did not produce a claim")
         return released
 
-    def status(self, task: TaskIdentity, *, now: datetime | None = None) -> ClaimDecision:
-        timestamp = now or self._now()
+    def status(
+        self, task: TaskIdentity, *, now: datetime | None = None
+    ) -> ClaimDecision:
+        timestamp = normalize_datetime(now or self._now())
         return self._decision_for_task(task, self._claims_by_id(), timestamp)
 
     def claim_by_id(self, claim_id: str) -> ClaimRecord | None:
@@ -316,13 +325,19 @@ class TaskCoordinator:
     ) -> ClaimDecision:
         claim = self._latest_claim_for_task(task, claims)
         if claim is None:
-            return ClaimDecision(ClaimState.NO_CLAIM, None, True, "no claim for task fingerprint")
+            return ClaimDecision(
+                ClaimState.NO_CLAIM, None, True, "no claim for task fingerprint"
+            )
         if claim.status != "active":
-            return ClaimDecision(ClaimState.RELEASED, claim, True, f"claim is {claim.status}")
+            return ClaimDecision(
+                ClaimState.RELEASED, claim, True, f"claim is {claim.status}"
+            )
         if timestamp >= claim.lease_expires_at:
             return ClaimDecision(ClaimState.EXPIRED, claim, True, "claim lease expired")
         if not self.pid_is_live(claim.owner.pid):
-            return ClaimDecision(ClaimState.OWNER_DEAD, claim, True, "claim owner process is not live")
+            return ClaimDecision(
+                ClaimState.OWNER_DEAD, claim, True, "claim owner process is not live"
+            )
         return ClaimDecision(ClaimState.ACTIVE, claim, False, "claim is active")
 
     def reclaimable(self, task: TaskIdentity, *, now: datetime | None = None) -> bool:
@@ -333,12 +348,10 @@ class TaskCoordinator:
         task: TaskIdentity,
         claims_by_id: dict[str, ClaimRecord] | None = None,
     ) -> ClaimRecord | None:
-        materialized = claims_by_id if claims_by_id is not None else self._claims_by_id()
-        claims = [
-            claim
-            for claim in materialized.values()
-            if claim.task == task
-        ]
+        materialized = (
+            claims_by_id if claims_by_id is not None else self._claims_by_id()
+        )
+        claims = [claim for claim in materialized.values() if claim.task == task]
         if not claims:
             return None
         return max(
@@ -501,7 +514,9 @@ class TaskCoordinator:
                 claim = claims.get(claim_id)
                 if claim is None:
                     continue
-                reason = str(event.get("release_reason") or event.get("status") or "released")
+                reason = str(
+                    event.get("release_reason") or event.get("status") or "released"
+                )
                 claims[claim_id] = ClaimRecord(
                     claim_id=claim.claim_id,
                     task=claim.task,
