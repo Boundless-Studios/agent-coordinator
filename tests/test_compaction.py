@@ -167,6 +167,48 @@ def test_compaction_preserves_existing_claims_log_permissions(tmp_path):
     assert stat.S_IMODE(store_path.stat().st_mode) == 0o660
 
 
+def test_compaction_tolerates_inability_to_preserve_claims_log_owner(
+    tmp_path, monkeypatch,
+):
+    store_path = tmp_path / "claims.jsonl"
+    store = JsonlClaimStore(store_path)
+    store.append_event({"event": "existing"})
+    store_path.chmod(0o660)
+
+    def reject_owner_change(_descriptor, _uid, _gid):
+        raise PermissionError("simulated shared-ledger owner")
+
+    monkeypatch.setattr("agent_coordinator.store.os.fchown", reject_owner_change)
+
+    store.transact_event(
+        lambda _events: {"event": "new"},
+        compact_events=lambda events: events,
+    )
+
+    assert store.read_events() == [{"event": "existing"}, {"event": "new"}]
+    assert stat.S_IMODE(store_path.stat().st_mode) == 0o660
+
+
+def test_compaction_replaces_symlink_target_without_replacing_symlink(tmp_path):
+    target_path = tmp_path / "shared" / "claims.jsonl"
+    target_path.parent.mkdir()
+    target_path.write_text('{"event": "existing"}\n', encoding="utf-8")
+    store_path = tmp_path / "claims.jsonl"
+    store_path.symlink_to(target_path)
+    store = JsonlClaimStore(store_path)
+
+    store.transact_event(
+        lambda _events: {"event": "new"},
+        compact_events=lambda events: events,
+    )
+
+    assert store_path.is_symlink()
+    assert JsonlClaimStore(target_path).read_events() == [
+        {"event": "existing"},
+        {"event": "new"},
+    ]
+
+
 def test_legacy_store_override_keeps_working_without_compaction_keyword(tmp_path):
     class LegacyStore(JsonlClaimStore):
         def transact_event(self, build_event):

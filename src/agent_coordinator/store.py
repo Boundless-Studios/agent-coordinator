@@ -85,25 +85,33 @@ class JsonlClaimStore:
             os.fsync(handle.fileno())
 
     def _replace_events_unlocked(self, events: list[dict[str, Any]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        existing_metadata = self.path.stat() if self.path.exists() else None
+        replacement_path = self.path.resolve() if self.path.is_symlink() else self.path
+        replacement_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_metadata = replacement_path.stat() if replacement_path.exists() else None
         descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{self.path.name}.",
+            prefix=f".{replacement_path.name}.",
             suffix=".tmp",
-            dir=self.path.parent,
+            dir=replacement_path.parent,
         )
         temporary = Path(temporary_path)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 if existing_metadata is not None:
-                    os.fchown(handle.fileno(), existing_metadata.st_uid, existing_metadata.st_gid)
+                    try:
+                        os.fchown(
+                            handle.fileno(),
+                            existing_metadata.st_uid,
+                            existing_metadata.st_gid,
+                        )
+                    except PermissionError:
+                        pass
                     os.fchmod(handle.fileno(), stat.S_IMODE(existing_metadata.st_mode))
                 for event in events:
                     handle.write(json.dumps(event, sort_keys=True) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-            directory_descriptor = os.open(self.path.parent, os.O_RDONLY)
+            os.replace(temporary, replacement_path)
+            directory_descriptor = os.open(replacement_path.parent, os.O_RDONLY)
             try:
                 os.fsync(directory_descriptor)
             finally:
