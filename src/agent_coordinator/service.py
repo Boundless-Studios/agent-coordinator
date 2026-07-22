@@ -356,6 +356,8 @@ class TaskCoordinator:
         build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
         timestamp: datetime,
     ) -> dict[str, Any]:
+        if not self.store.supports_atomic_compaction():
+            return self.store.transact_event(build_event)
         return self.store.transact_event(
             build_event,
             compact_events=lambda events: self._compact_events(events, timestamp),

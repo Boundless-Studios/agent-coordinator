@@ -150,3 +150,22 @@ def test_failed_atomic_rewrite_leaves_original_log_unchanged(tmp_path, monkeypat
 
     assert store.path.read_bytes() == original
     assert list(tmp_path.glob(".claims.jsonl.*.tmp")) == []
+
+
+def test_legacy_store_override_keeps_working_without_compaction_keyword(tmp_path):
+    class LegacyStore(JsonlClaimStore):
+        def transact_event(self, build_event):
+            return super().transact_event(build_event)
+
+    coord = TaskCoordinator(
+        LegacyStore(tmp_path / "claims.jsonl"),
+        pid_is_live=lambda _pid: True,
+        compaction_event_threshold=1,
+    )
+
+    claim = coord.claim_task(
+        task("legacy-store"), owner("legacy-store", 101),
+        lease_seconds=60, now=BASE_TIME,
+    )
+
+    assert coord.claim_by_id(claim.claim_id) == claim

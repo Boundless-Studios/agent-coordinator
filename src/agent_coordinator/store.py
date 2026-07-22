@@ -52,6 +52,10 @@ class JsonlClaimStore:
         with _exclusive_lock(self.lock_path):
             return self._read_events_unlocked()
 
+    def supports_atomic_compaction(self) -> bool:
+        """Return whether ``transact_event`` accepts a compaction callback."""
+        return type(self).transact_event is JsonlClaimStore.transact_event
+
     def transact_event(
         self,
         build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
