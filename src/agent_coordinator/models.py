@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
 def datetime_to_json(value: datetime) -> str:
-    return value.isoformat().replace("+00:00", "Z")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def datetime_from_json(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -74,7 +79,9 @@ class OwnerIdentity:
             pid=int(raw_pid) if raw_pid is not None else None,
             agent=str(payload.get("agent") or "unknown"),
             worktree_path=payload.get("worktree_path"),
-            metadata={str(k): str(v) for k, v in dict(payload.get("metadata") or {}).items()},
+            metadata={
+                str(k): str(v) for k, v in dict(payload.get("metadata") or {}).items()
+            },
         )
 
 
