@@ -6,12 +6,21 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import tempfile
 from typing import Any, Callable, Iterator, Optional
 
 
 EventCompactor = Callable[[list[dict[str, Any]]], Optional[list[dict[str, Any]]]]
+
+
+def _copy_extended_attributes(source: Path, destination: Path) -> None:
+    """Best-effort copy of ACLs and other extended inode metadata."""
+    try:
+        shutil.copystat(source, destination)
+    except OSError:
+        pass
 
 
 @contextmanager
@@ -43,7 +52,8 @@ class JsonlClaimStore:
 
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
-        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        resolved_path = self.path.resolve()
+        self.lock_path = resolved_path.with_suffix(resolved_path.suffix + ".lock")
 
     def append_event(self, event: dict[str, Any]) -> None:
         with _exclusive_lock(self.lock_path):
@@ -110,6 +120,8 @@ class JsonlClaimStore:
                     handle.write(json.dumps(event, sort_keys=True) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            if existing_metadata is not None:
+                _copy_extended_attributes(replacement_path, temporary)
             os.replace(temporary, replacement_path)
             directory_descriptor = os.open(replacement_path.parent, os.O_RDONLY)
             try:

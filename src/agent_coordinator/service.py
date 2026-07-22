@@ -383,7 +383,13 @@ class TaskCoordinator:
         claims = self._claims_by_id(events)
         activity_by_claim = self._activity_by_claim(events)
         cutoff = timestamp - self.claim_history_retention
-        snapshots: list[dict[str, Any]] = []
+        snapshots = [
+            event
+            for event in events
+            if isinstance(event.get("event"), str)
+            and event.get("event")
+            not in {"claimed", "heartbeat", "released", "compaction"}
+        ]
         for claim in sorted(claims.values(), key=lambda item: item.claim_id):
             activity = activity_by_claim.get(claim.claim_id, claim.heartbeat_at)
             if claim.status == "active" and claim.lease_expires_at <= timestamp:

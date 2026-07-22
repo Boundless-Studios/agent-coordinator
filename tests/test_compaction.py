@@ -209,6 +209,55 @@ def test_compaction_replaces_symlink_target_without_replacing_symlink(tmp_path):
     ]
 
 
+def test_symlink_and_direct_stores_share_the_same_lock(tmp_path):
+    target_path = tmp_path / "shared" / "claims.jsonl"
+    target_path.parent.mkdir()
+    target_path.touch()
+    symlink_path = tmp_path / "claims.jsonl"
+    symlink_path.symlink_to(target_path)
+
+    assert JsonlClaimStore(symlink_path).lock_path == JsonlClaimStore(target_path).lock_path
+
+
+def test_compaction_copies_extended_metadata(tmp_path, monkeypatch):
+    store_path = tmp_path / "claims.jsonl"
+    store = JsonlClaimStore(store_path)
+    store.append_event({"event": "existing"})
+    copied: list[tuple[object, object]] = []
+
+    def record_copystat(source, destination):
+        copied.append((source, destination))
+
+    monkeypatch.setattr("agent_coordinator.store.shutil.copystat", record_copystat)
+
+    store.transact_event(
+        lambda _events: {"event": "new"},
+        compact_events=lambda events: events,
+    )
+
+    assert len(copied) == 1
+    assert copied[0][0] == store_path
+
+
+def test_compaction_retains_unrecognized_events(tmp_path):
+    coord = coordinator(tmp_path, threshold=2)
+    unknown_event = {
+        "event": "future_extension",
+        "timestamp": "2026-07-20T12:00:00Z",
+        "payload": {"audit": "retain me"},
+    }
+    coord.store.append_event(unknown_event)
+
+    coord.claim_task(
+        task("trigger"),
+        owner("trigger", 101),
+        lease_seconds=60,
+        now=BASE_TIME,
+    )
+
+    assert unknown_event in coord.store.read_events()
+
+
 def test_legacy_store_override_keeps_working_without_compaction_keyword(tmp_path):
     class LegacyStore(JsonlClaimStore):
         def transact_event(self, build_event):
