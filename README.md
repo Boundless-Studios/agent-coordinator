@@ -66,6 +66,111 @@ followed by a write transaction is a TOCTOU gap, and any pause between the two
 lets a stale owner re-arm. The in-transaction fence is what makes the mutation
 safe.
 
+## Human decisions
+
+*Requires `0.4.0` or newer.*
+
+Ownership answers *who is working on a task*. A decision answers *what the agent
+is blocked on, and who unblocked it*. An agent that reaches a boundary it does
+not own — a service split, a schema change, a trust boundary — records a
+decision request and stops, instead of guessing.
+
+```text
+active ──request──▶ waiting_human ──human answer──▶ resumable ──resume──▶ active ──▶ released
+```
+
+`cancelled` and `superseded` are the explicit terminal paths. **Time alone never
+moves `waiting_human` to `resumable`, and never selects an option.** There is no
+timeout, no default answer, and no auto-proceed. Downstream loops depend on this:
+an unresolved decision is a *waiting* state, not an executor failure, so it must
+not feed a retry/death loop.
+
+```bash
+agent-coordinator decision-request \
+  --type pr-maintenance --id github:org/repo#8 --fingerprint comments:a \
+  --claim-id <claim-id> --session-id s1 --runtime codex \
+  --logical-key turn-orchestration-boundary \
+  --category architecture \
+  --question "Should turn orchestration own its own service boundary?" \
+  --option "id=split-service,summary=Own service,tradeoffs=Clean boundary; new deploy unit" \
+  --option "id=keep-module,summary=Keep in module,tradeoffs=No new infra; implicit boundary" \
+  --recommendation keep-module \
+  --rationale "Reversible today; the cross-process hop is not yet justified" \
+  --affected-scope backend/src/gaia/orchestrator \
+  --evidence-fingerprint evidence:v1
+# {"decision_id":"...","state":"waiting_human",...}
+
+agent-coordinator decision-status --type pr-maintenance --id github:org/repo#8 --fingerprint comments:a
+
+agent-coordinator decision-resolve \
+  --decision-id <decision-id> \
+  --request-fingerprint evidence:v1 \
+  --human-actor ilya \
+  --option-id split-service
+# {"state":"resumable",...}
+
+agent-coordinator task-resume \
+  --decision-id <decision-id> --claim-id <claim-id> \
+  --session-id s2 --lease-epoch 2
+# {"state":"resumed",...}
+```
+
+`decision-cancel` withdraws a question; `decision-list` filters by `--state` and
+optionally by task.
+
+### Two fingerprints, deliberately
+
+`--fingerprint` identifies the **task**. `--evidence-fingerprint` covers the
+**evidence and task state the question is about**. They are separate because work
+can move on in ways that invalidate the question without changing task identity.
+
+Re-requesting with the same `--logical-key` and the same `--evidence-fingerprint`
+is idempotent: same question, same evidence, one ledger entry. Re-requesting with
+a *changed* evidence fingerprint supersedes the prior request and opens a new one,
+and a resolution carrying the superseded fingerprint is rejected with
+`stale_decision_fingerprint` — a human cannot accidentally answer a question that
+no longer exists.
+
+Supersession is carried on the replacement's own `decision_requested` event
+rather than as a separate event. Two appends would leave a window in which the
+old decision is retired and the replacement does not exist yet; in that window
+the task has no blocking decision and could be released as `completed` with the
+question still unanswered.
+
+### Completion is gated, yielding is not
+
+Releasing with a reason in `TERMINAL_RELEASE_REASONS` (`completed`,
+`terminal_clean`) fails with `decision_pending` while any decision on that task
+is `waiting_human`. Every other reason still succeeds, so a headless executor
+can yield and exit without losing the question. The check runs *inside* the
+release transaction for the same TOCTOU reason as the lease fence.
+
+### Surviving the process that asked
+
+Decision state is derived from the ledger and keyed off task identity — never off
+claim status. An agent that dies mid-question leaves a complete, replayable
+record. After a human answers, a **replacement** owner may claim the task and
+call `task-resume`; the resumed work can cite the direction it was given.
+
+Resolution unblocks; it does not transfer ownership or execute anything. Nothing
+runs until some owner explicitly claims the task.
+
+`task-resume` is fenced by the same lease epoch as `heartbeat` and `release`, so
+a deposed owner cannot record a resume and start a second runtime on one task.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success |
+| `3` | Claim conflict |
+| `4` | `stale_lease_epoch` |
+| `5` | `stale_decision_fingerprint` |
+| `6` | `decision_pending` — terminal completion blocked |
+| `7` | `decision_not_resumable` — resume before a human answered |
+| `8` | Malformed request or resolution |
+| `9` | Unknown decision or claim |
+
 ## Bounded claim history
 
 The coordinator compacts `claims.jsonl` after 1,000 new events by default.

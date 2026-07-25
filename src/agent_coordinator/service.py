@@ -11,6 +11,10 @@ import uuid
 
 from .models import (
     ClaimRecord,
+    DecisionRecord,
+    DecisionRequest,
+    DecisionResolution,
+    DecisionState,
     OwnerIdentity,
     TaskIdentity,
     datetime_from_json,
@@ -23,6 +27,25 @@ from .store import JsonlClaimStore
 SUPERSEDED_STATUS = "superseded"
 DEFAULT_COMPACTION_EVENT_THRESHOLD = 1_000
 DEFAULT_CLAIM_HISTORY_RETENTION = timedelta(days=7)
+
+# Releasing for one of these reasons asserts the work is *done*. A decision the
+# human still owes an answer to means it demonstrably is not, so these are the
+# reasons the decision gate blocks. Every other reason (yield, abandon, hand
+# off) stays available precisely so a blocked executor can exit cleanly.
+TERMINAL_RELEASE_REASONS = frozenset({"completed", "terminal_clean"})
+
+# Supersession is deliberately absent: it is carried on the replacement's own
+# decision_requested event (supersedes_decision_id) so retiring the old question
+# and opening the new one is a single atomic append. Splitting it out would
+# leave a window with no blocking decision on the task.
+DECISION_EVENT_TYPES = frozenset(
+    {
+        "decision_requested",
+        "decision_resolved",
+        "decision_cancelled",
+        "task_resumed",
+    }
+)
 
 
 class ClaimState(str, Enum):
@@ -75,6 +98,62 @@ class StaleClaimError(RuntimeError):
         super().__init__(
             f"stale lease epoch: expected {expected_epoch}, received {received_epoch}"
         )
+
+
+class StaleDecisionError(RuntimeError):
+    """Raised when a resolution does not answer the request that is live now.
+
+    Sibling of :class:`StaleClaimError`. ``superseding_decision_id`` names the
+    request that replaced the one being answered, so a human transport can
+    re-present the current question instead of only reporting a rejection.
+    """
+
+    def __init__(
+        self,
+        *,
+        decision_id: str,
+        expected_fingerprint: str,
+        received_fingerprint: str,
+        superseding_decision_id: str | None = None,
+    ):
+        self.decision_id = decision_id
+        self.expected_fingerprint = expected_fingerprint
+        self.received_fingerprint = received_fingerprint
+        self.superseding_decision_id = superseding_decision_id
+        super().__init__(
+            f"stale decision fingerprint for {decision_id}: "
+            f"expected {expected_fingerprint}, received {received_fingerprint}"
+        )
+
+
+class DecisionPendingError(RuntimeError):
+    """Raised when terminal completion is attempted with a question outstanding."""
+
+    def __init__(self, decision_ids: list[str]):
+        self.decision_ids = decision_ids
+        super().__init__(
+            "cannot complete a task with unresolved decisions: "
+            + ", ".join(decision_ids)
+        )
+
+
+class _NoEventNeeded(Exception):
+    """Internal: the transaction found nothing to record.
+
+    ``JsonlClaimStore.transact_event`` appends whatever ``build_event`` returns,
+    with no way to return "nothing". Raising aborts before the append while the
+    lock is still held, which is what makes the idempotent paths safe against a
+    concurrent writer.
+    """
+
+
+class DecisionNotResumableError(RuntimeError):
+    """Raised when resume is attempted before a human has actually answered."""
+
+    def __init__(self, decision_id: str, state: DecisionState):
+        self.decision_id = decision_id
+        self.state = state
+        super().__init__(f"decision {decision_id} is {state.value}, not resumable")
 
 
 def default_pid_is_live(pid: int | None) -> bool:
@@ -250,6 +329,19 @@ class TaskCoordinator:
             self._assert_epoch_is_current(claim, claims, lease_epoch)
 
             release_reason = reason or "released"
+            # Evaluated inside the transaction, against the event list read under
+            # the lock. Checking before the transaction would be a TOCTOU: a
+            # decision requested concurrently would be missed and a "completed"
+            # release would slip through with a question still outstanding.
+            if release_reason in TERMINAL_RELEASE_REASONS:
+                blocking = [
+                    record.request.decision_id
+                    for record in self._decisions_for_task(claim.task, events)
+                    if record.is_blocking
+                ]
+                if blocking:
+                    raise DecisionPendingError(sorted(blocking))
+
             released = ClaimRecord(
                 claim_id=claim.claim_id,
                 task=claim.task,
@@ -288,6 +380,376 @@ class TaskCoordinator:
         A deposed owner can use this to learn that its own claim was superseded.
         """
         return self._claims_by_id().get(claim_id)
+
+    # ------------------------------------------------------------------
+    # Human decisions
+    # ------------------------------------------------------------------
+
+    def request_decision(
+        self,
+        task: TaskIdentity,
+        *,
+        claim_id: str,
+        logical_key: str,
+        category: str,
+        question: str,
+        options,
+        recommendation: str,
+        rationale: str,
+        affected_scope,
+        fingerprint: str,
+        requesting_runtime: str,
+        requesting_session_id: str,
+        now: datetime | None = None,
+    ) -> DecisionRecord:
+        """Record that the agent owes a human an answer before proceeding.
+
+        Idempotent on ``(task, logical_key, fingerprint)``: asking the same
+        question about the same evidence twice returns the existing request. A
+        changed fingerprint means the question no longer describes reality, so
+        the prior request is superseded and a new one is opened.
+        """
+        timestamp = normalize_datetime(now or self._now())
+        # Validate before opening the transaction so a malformed request never
+        # holds the store lock.
+        candidate = DecisionRequest(
+            decision_id=uuid.uuid4().hex,
+            task=task,
+            claim_id=claim_id,
+            logical_key=logical_key,
+            category=category,
+            question=question,
+            options=tuple(options),
+            recommendation=recommendation,
+            rationale=rationale,
+            affected_scope=tuple(affected_scope),
+            fingerprint=fingerprint,
+            requesting_runtime=requesting_runtime,
+            requesting_session_id=requesting_session_id,
+            created_at=timestamp,
+        )
+        result: DecisionRecord | None = None
+
+        def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal result
+            existing = self._open_decision_for_logical_key(task, logical_key, events)
+            if existing is not None and existing.request.fingerprint == fingerprint:
+                # Same question, same evidence: already on the ledger. Aborting
+                # the transaction is what makes this idempotent under
+                # concurrency — the check and the decision not to write happen
+                # under the same lock as the read.
+                result = existing
+                raise _NoEventNeeded
+
+            event: dict[str, Any] = {
+                "event": "decision_requested",
+                "timestamp": datetime_to_json(timestamp),
+                "request": candidate.to_dict(),
+            }
+            if existing is not None:
+                event["supersedes_decision_id"] = existing.request.decision_id
+            result = DecisionRecord(
+                request=candidate,
+                state=DecisionState.WAITING_HUMAN,
+            )
+            return event
+
+        self._transact_decision_event(build_event, timestamp)
+        if result is None:
+            raise RuntimeError("decision request transaction did not produce a record")
+        return result
+
+    def resolve_decision(
+        self,
+        decision_id: str,
+        *,
+        request_fingerprint: str,
+        human_actor: str,
+        selected_option_id: str | None = None,
+        direction: str | None = None,
+        rationale: str | None = None,
+        now: datetime | None = None,
+    ) -> DecisionRecord:
+        """Record a human's answer. This unblocks; it does not resume."""
+        timestamp = normalize_datetime(now or self._now())
+        resolution = DecisionResolution(
+            decision_id=decision_id,
+            request_fingerprint=request_fingerprint,
+            human_actor=human_actor,
+            resolved_at=timestamp,
+            selected_option_id=selected_option_id,
+            direction=direction,
+            rationale=rationale,
+        )
+        result: DecisionRecord | None = None
+
+        def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal result
+            decisions = self._decisions_by_id(events)
+            record = decisions.get(decision_id)
+            if record is None:
+                raise KeyError(f"unknown decision_id: {decision_id}")
+            if record.state is not DecisionState.WAITING_HUMAN:
+                raise StaleDecisionError(
+                    decision_id=decision_id,
+                    expected_fingerprint=record.request.fingerprint,
+                    received_fingerprint=request_fingerprint,
+                    superseding_decision_id=record.superseded_by,
+                )
+            if record.request.fingerprint != request_fingerprint:
+                raise StaleDecisionError(
+                    decision_id=decision_id,
+                    expected_fingerprint=record.request.fingerprint,
+                    received_fingerprint=request_fingerprint,
+                )
+            if selected_option_id and not record.request.has_option(selected_option_id):
+                raise ValueError(
+                    f"{selected_option_id!r} is not an option on {decision_id}"
+                )
+            result = DecisionRecord(
+                request=record.request,
+                state=DecisionState.RESUMABLE,
+                resolution=resolution,
+            )
+            return {
+                "event": "decision_resolved",
+                "timestamp": datetime_to_json(timestamp),
+                "decision_id": decision_id,
+                "resolution": resolution.to_dict(),
+            }
+
+        self._transact_decision_event(build_event, timestamp)
+        if result is None:
+            raise RuntimeError("resolve transaction did not produce a record")
+        return result
+
+    def cancel_decision(
+        self,
+        decision_id: str,
+        *,
+        actor: str,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> DecisionRecord:
+        """Withdraw a question. An explicit human/admin act, never a timeout."""
+        timestamp = normalize_datetime(now or self._now())
+        result: DecisionRecord | None = None
+
+        def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal result
+            record = self._decisions_by_id(events).get(decision_id)
+            if record is None:
+                raise KeyError(f"unknown decision_id: {decision_id}")
+            if record.state is DecisionState.CANCELLED:
+                result = record
+                raise _NoEventNeeded
+            result = DecisionRecord(
+                request=record.request,
+                state=DecisionState.CANCELLED,
+                resolution=record.resolution,
+                cancelled_by=actor,
+                cancel_reason=reason,
+            )
+            return {
+                "event": "decision_cancelled",
+                "timestamp": datetime_to_json(timestamp),
+                "decision_id": decision_id,
+                "cancelled_by": actor,
+                "cancel_reason": reason,
+            }
+
+        self._transact_decision_event(build_event, timestamp)
+        if result is None:
+            raise RuntimeError("cancel transaction did not produce a record")
+        return result
+
+    def resume_task(
+        self,
+        decision_id: str,
+        *,
+        claim_id: str,
+        owner_session_id: str,
+        lease_epoch: int,
+        now: datetime | None = None,
+    ) -> DecisionRecord:
+        """Take up answered work under a live claim.
+
+        The resuming claim may belong to a replacement owner. It must be the
+        task's *current* claim: the same lease-epoch fence that protects
+        heartbeat and release applies here, so a deposed owner cannot record a
+        resume and start a second runtime on the same task.
+        """
+        timestamp = normalize_datetime(now or self._now())
+        result: DecisionRecord | None = None
+
+        def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal result
+            decisions = self._decisions_by_id(events)
+            record = decisions.get(decision_id)
+            if record is None:
+                raise KeyError(f"unknown decision_id: {decision_id}")
+
+            claims = self._claims_by_id(events)
+            claim = claims.get(claim_id)
+            if claim is None:
+                raise KeyError(f"unknown claim_id: {claim_id}")
+            if claim.owner.session_id != owner_session_id:
+                raise PermissionError("owner_session_id does not own claim")
+            self._assert_epoch_is_current(claim, claims, lease_epoch)
+
+            if (
+                record.state is DecisionState.RESUMED
+                and record.resumed_by_claim_id == claim_id
+            ):
+                result = record
+                raise _NoEventNeeded
+            if record.state is not DecisionState.RESUMABLE:
+                raise DecisionNotResumableError(decision_id, record.state)
+
+            result = DecisionRecord(
+                request=record.request,
+                state=DecisionState.RESUMED,
+                resolution=record.resolution,
+                resumed_by_claim_id=claim_id,
+            )
+            return {
+                "event": "task_resumed",
+                "timestamp": datetime_to_json(timestamp),
+                "decision_id": decision_id,
+                "claim_id": claim_id,
+                "owner_session_id": owner_session_id,
+                "lease_epoch": lease_epoch,
+            }
+
+        self._transact_decision_event(build_event, timestamp)
+        if result is None:
+            raise RuntimeError("resume transaction did not produce a record")
+        return result
+
+    def decision_status(
+        self, task: TaskIdentity, *, now: datetime | None = None
+    ) -> DecisionRecord | None:
+        """The decision currently gating ``task``, if any.
+
+        ``now`` is accepted for call-site symmetry with :meth:`status` and is
+        deliberately unused: no elapsed time advances a decision.
+        """
+        open_states = (DecisionState.WAITING_HUMAN, DecisionState.RESUMABLE)
+        candidates = [
+            record
+            for record in self._decisions_for_task(task)
+            if record.state in open_states
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda record: record.request.created_at)
+
+    def decision_by_id(self, decision_id: str) -> DecisionRecord | None:
+        return self._decisions_by_id().get(decision_id)
+
+    def list_decisions(
+        self,
+        *,
+        task: TaskIdentity | None = None,
+        state: DecisionState | None = None,
+    ) -> list[DecisionRecord]:
+        records = list(self._decisions_by_id().values())
+        if task is not None:
+            records = [record for record in records if record.request.task == task]
+        if state is not None:
+            records = [record for record in records if record.state is state]
+        return sorted(records, key=lambda record: record.request.created_at)
+
+    def pending_decisions(self, task: TaskIdentity) -> list[DecisionRecord]:
+        """Decisions that block terminal completion of ``task``."""
+        return [record for record in self._decisions_for_task(task) if record.is_blocking]
+
+    def _decisions_for_task(
+        self,
+        task: TaskIdentity,
+        events: list[dict[str, Any]] | None = None,
+    ) -> list[DecisionRecord]:
+        # Keyed off task identity and decision events only — never off claim
+        # status. That is what lets a question outlive the process that asked it.
+        return [
+            record
+            for record in self._decisions_by_id(events).values()
+            if record.request.task == task
+        ]
+
+    def _open_decision_for_logical_key(
+        self,
+        task: TaskIdentity,
+        logical_key: str,
+        events: list[dict[str, Any]],
+    ) -> DecisionRecord | None:
+        candidates = [
+            record
+            for record in self._decisions_for_task(task, events)
+            if record.request.logical_key == logical_key
+            and record.state is DecisionState.WAITING_HUMAN
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda record: record.request.created_at)
+
+    def _decisions_by_id(
+        self,
+        events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, DecisionRecord]:
+        """Fold decision events into current records.
+
+        The decision analogue of :meth:`_claims_by_id`: a pure function of the
+        event list that ignores event types it does not own, so claim and
+        decision state coexist in one ledger without interfering.
+        """
+        records: dict[str, DecisionRecord] = {}
+        source_events = self.store.read_events() if events is None else events
+        for event in source_events:
+            event_type = event.get("event")
+            if event_type not in DECISION_EVENT_TYPES:
+                continue
+            if event_type == "decision_requested":
+                request = DecisionRequest.from_dict(dict(event["request"]))
+                superseded_id = event.get("supersedes_decision_id")
+                if superseded_id:
+                    prior = records.get(str(superseded_id))
+                    if prior is not None and prior.state is DecisionState.WAITING_HUMAN:
+                        records[prior.request.decision_id] = replace(
+                            prior,
+                            state=DecisionState.SUPERSEDED,
+                            superseded_by=request.decision_id,
+                        )
+                records[request.decision_id] = DecisionRecord(
+                    request=request,
+                    state=DecisionState.WAITING_HUMAN,
+                )
+                continue
+
+            decision_id = str(event.get("decision_id") or "")
+            record = records.get(decision_id)
+            if record is None:
+                continue
+            if event_type == "decision_resolved":
+                records[decision_id] = replace(
+                    record,
+                    state=DecisionState.RESUMABLE,
+                    resolution=DecisionResolution.from_dict(dict(event["resolution"])),
+                )
+            elif event_type == "decision_cancelled":
+                records[decision_id] = replace(
+                    record,
+                    state=DecisionState.CANCELLED,
+                    cancelled_by=event.get("cancelled_by"),
+                    cancel_reason=event.get("cancel_reason"),
+                )
+            elif event_type == "task_resumed":
+                records[decision_id] = replace(
+                    record,
+                    state=DecisionState.RESUMED,
+                    resumed_by_claim_id=str(event.get("claim_id") or "") or None,
+                )
+        return records
 
     def _assert_epoch_is_current(
         self,
@@ -375,6 +837,17 @@ class TaskCoordinator:
             build_event,
             compact_events=lambda events: self._compact_events(events, timestamp),
         )
+
+    def _transact_decision_event(
+        self,
+        build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
+        timestamp: datetime,
+    ) -> None:
+        """Run a decision transaction, tolerating an idempotent no-op."""
+        try:
+            self._transact_event(build_event, timestamp)
+        except _NoEventNeeded:
+            return
 
     def _compact_events(
         self,

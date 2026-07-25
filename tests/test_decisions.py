@@ -263,7 +263,39 @@ def test_changed_fingerprint_supersedes_the_prior_request(tmp_path):
     assert superseded.state is DecisionState.SUPERSEDED
     assert superseded.superseded_by == second.request.decision_id
     assert count_events(tmp_path, "decision_requested") == 2
-    assert count_events(tmp_path, "decision_superseded") == 1
+
+
+def test_supersession_is_atomic_with_the_replacement_request(tmp_path):
+    """Retiring the old question and opening the new one is ONE append.
+
+    Two appends would leave a window where the old decision is superseded and
+    the replacement does not exist yet. In that window the task has no blocking
+    decision and could be released as completed with the question unanswered.
+    So supersession rides on the replacement's own event, mirroring how
+    claim_task carries superseded_claim_ids.
+    """
+    coord = coordinator(tmp_path)
+    claim, first = claim_and_request(coord)
+    second = coord.request_decision(
+        task(),
+        claim_id=claim.claim_id,
+        now=BASE_TIME + timedelta(minutes=5),
+        **request_kwargs(fingerprint="evidence:v2"),
+    )
+
+    requested = [
+        event
+        for event in ledger_events(tmp_path)
+        if event.get("event") == "decision_requested"
+    ]
+    assert requested[0].get("supersedes_decision_id") is None
+    assert requested[1]["supersedes_decision_id"] == first.request.decision_id
+    assert requested[1]["request"]["decision_id"] == second.request.decision_id
+
+    # Replaying the ledger up to and including that single event never yields a
+    # task with zero blocking decisions.
+    replayed = TaskCoordinator(JsonlClaimStore(store_path(tmp_path)))
+    assert len(replayed.pending_decisions(task())) == 1
 
 
 def test_a_different_logical_key_is_a_separate_decision(tmp_path):
