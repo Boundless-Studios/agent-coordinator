@@ -263,3 +263,318 @@ def test_cli_rejects_deposed_owner_mutations_on_its_own_claim(tmp_path, capsys):
     assert code == 0
     assert status["state"] == "active"
     assert status["claim"]["claim_id"] == second_claim["claim_id"]
+
+
+# ---------------------------------------------------------------------------
+# Decision protocol (BOU-2039)
+#
+# Driven through main() rather than a shell so the argparse wiring, exit codes,
+# and JSON payloads are all covered. Codex and Claude share exactly this
+# surface, so a break here is a break for both runtimes.
+# ---------------------------------------------------------------------------
+
+
+def decision_common(store):
+    return [
+        "--store",
+        str(store),
+        "--type",
+        "pr-maintenance",
+        "--id",
+        "github:Boundless-Studios/agentic-pr-dash#8",
+        "--fingerprint",
+        "comments:a",
+    ]
+
+
+def request_args(store, claim_id, *, evidence="evidence:v1", extra=None):
+    args = [
+        "decision-request",
+        *decision_common(store),
+        "--claim-id",
+        claim_id,
+        "--session-id",
+        "s1",
+        "--runtime",
+        "codex",
+        "--logical-key",
+        "turn-orchestration-boundary",
+        "--category",
+        "architecture",
+        "--question",
+        "Should turn orchestration own its own service boundary?",
+        "--option",
+        "id=split-service,summary=Own service,tradeoffs=Clean boundary; new deploy unit",
+        "--option",
+        "id=keep-module,summary=Keep in module,tradeoffs=No new infra; implicit boundary",
+        "--recommendation",
+        "keep-module",
+        "--rationale",
+        "Reversible today",
+        "--affected-scope",
+        "backend/src/gaia/orchestrator",
+        "--evidence-fingerprint",
+        evidence,
+    ]
+    args.extend(extra or [])
+    return args
+
+
+def claim_for_decision(store, capsys) -> dict:
+    code, claimed = run_cli(
+        [
+            "claim",
+            *decision_common(store),
+            "--session-id",
+            "s1",
+            "--pid",
+            "0",
+            "--agent",
+            "codex",
+            "--lease-seconds",
+            "600",
+        ],
+        capsys,
+    )
+    assert code == 0
+    return claimed["claim"]
+
+
+def test_cli_decision_request_resolve_resume_flow(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+    claim = claim_for_decision(store, capsys)
+
+    code, requested = run_cli(request_args(store, claim["claim_id"]), capsys)
+    assert code == 0
+    assert requested["state"] == "waiting_human"
+    decision_id = requested["decision_id"]
+    assert len(requested["request"]["options"]) == 2
+
+    code, status = run_cli(["decision-status", *decision_common(store)], capsys)
+    assert code == 0
+    assert status["decision"]["decision_id"] == decision_id
+
+    # Completion is blocked while the human still owes an answer.
+    release = [
+        "release",
+        "--store",
+        str(store),
+        "--claim-id",
+        claim["claim_id"],
+        "--session-id",
+        "s1",
+        "--lease-epoch",
+        str(claim["lease_epoch"]),
+    ]
+    code, blocked = run_cli([*release, "--reason", "completed"], capsys)
+    assert code == 6
+    assert blocked["error"] == "decision_pending"
+    assert blocked["decision_ids"] == [decision_id]
+
+    code, resolved = run_cli(
+        [
+            "decision-resolve",
+            "--store",
+            str(store),
+            "--decision-id",
+            decision_id,
+            "--request-fingerprint",
+            "evidence:v1",
+            "--human-actor",
+            "ilya",
+            "--option-id",
+            "split-service",
+        ],
+        capsys,
+    )
+    assert code == 0
+    assert resolved["state"] == "resumable"
+
+    code, resumed = run_cli(
+        [
+            "task-resume",
+            "--store",
+            str(store),
+            "--decision-id",
+            decision_id,
+            "--claim-id",
+            claim["claim_id"],
+            "--session-id",
+            "s1",
+            "--lease-epoch",
+            str(claim["lease_epoch"]),
+        ],
+        capsys,
+    )
+    assert code == 0
+    assert resumed["state"] == "resumed"
+    assert resumed["resolution"]["selected_option_id"] == "split-service"
+
+    code, released = run_cli([*release, "--reason", "completed"], capsys)
+    assert code == 0
+    assert released["claim"]["status"] == "completed"
+
+
+def test_cli_duplicate_request_is_idempotent(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+    claim = claim_for_decision(store, capsys)
+
+    code, first = run_cli(request_args(store, claim["claim_id"]), capsys)
+    assert code == 0
+    code, second = run_cli(request_args(store, claim["claim_id"]), capsys)
+    assert code == 0
+    assert second["decision_id"] == first["decision_id"]
+
+    events = [
+        json.loads(line)
+        for line in store.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert sum(1 for e in events if e.get("event") == "decision_requested") == 1
+
+
+def test_cli_stale_resolution_exits_distinctly(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+    claim = claim_for_decision(store, capsys)
+    code, first = run_cli(request_args(store, claim["claim_id"]), capsys)
+    assert code == 0
+    code, second = run_cli(
+        request_args(store, claim["claim_id"], evidence="evidence:v2"), capsys
+    )
+    assert code == 0
+
+    code, stale = run_cli(
+        [
+            "decision-resolve",
+            "--store",
+            str(store),
+            "--decision-id",
+            first["decision_id"],
+            "--request-fingerprint",
+            "evidence:v1",
+            "--human-actor",
+            "ilya",
+            "--option-id",
+            "split-service",
+        ],
+        capsys,
+    )
+    assert code == 5
+    assert stale["error"] == "stale_decision_fingerprint"
+    assert stale["superseding_decision_id"] == second["decision_id"]
+
+
+def test_cli_non_terminal_release_is_allowed_while_waiting(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+    claim = claim_for_decision(store, capsys)
+    code, requested = run_cli(request_args(store, claim["claim_id"]), capsys)
+    assert code == 0
+
+    code, released = run_cli(
+        [
+            "release",
+            "--store",
+            str(store),
+            "--claim-id",
+            claim["claim_id"],
+            "--session-id",
+            "s1",
+            "--lease-epoch",
+            str(claim["lease_epoch"]),
+            "--reason",
+            "yielded",
+        ],
+        capsys,
+    )
+    assert code == 0
+    assert released["claim"]["status"] == "yielded"
+
+    code, status = run_cli(["decision-status", *decision_common(store)], capsys)
+    assert status["decision"]["state"] == "waiting_human"
+
+
+def test_cli_resume_before_resolution_exits_distinctly(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+    claim = claim_for_decision(store, capsys)
+    code, requested = run_cli(request_args(store, claim["claim_id"]), capsys)
+    assert code == 0
+
+    code, payload = run_cli(
+        [
+            "task-resume",
+            "--store",
+            str(store),
+            "--decision-id",
+            requested["decision_id"],
+            "--claim-id",
+            claim["claim_id"],
+            "--session-id",
+            "s1",
+            "--lease-epoch",
+            str(claim["lease_epoch"]),
+        ],
+        capsys,
+    )
+    assert code == 7
+    assert payload["error"] == "decision_not_resumable"
+    assert payload["state"] == "waiting_human"
+
+
+def test_cli_rejects_a_single_option(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+    claim = claim_for_decision(store, capsys)
+    args = request_args(store, claim["claim_id"])
+    # Drop the second --option pair.
+    index = args.index("--option", args.index("--option") + 1)
+    del args[index : index + 2]
+
+    code, payload = run_cli(args, capsys)
+    assert code == 8
+    assert payload["error"] == "invalid_decision_request"
+
+
+def test_cli_decision_list_filters_by_state(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+    claim = claim_for_decision(store, capsys)
+    code, first = run_cli(request_args(store, claim["claim_id"]), capsys)
+    assert code == 0
+    code, second = run_cli(
+        request_args(
+            store,
+            claim["claim_id"],
+            extra=["--logical-key", "schema-compat"],
+            evidence="evidence:s1",
+        ),
+        capsys,
+    )
+    assert code == 0
+    code, _ = run_cli(
+        [
+            "decision-resolve",
+            "--store",
+            str(store),
+            "--decision-id",
+            second["decision_id"],
+            "--request-fingerprint",
+            "evidence:s1",
+            "--human-actor",
+            "ilya",
+            "--direction",
+            "Neither; inline it.",
+        ],
+        capsys,
+    )
+    assert code == 0
+
+    code, waiting = run_cli(
+        ["decision-list", "--store", str(store), "--state", "waiting_human"], capsys
+    )
+    assert code == 0
+    assert [d["decision_id"] for d in waiting["decisions"]] == [first["decision_id"]]
+
+    code, resumable = run_cli(
+        ["decision-list", "--store", str(store), "--state", "resumable"], capsys
+    )
+    assert [d["decision_id"] for d in resumable["decisions"]] == [
+        second["decision_id"]
+    ]

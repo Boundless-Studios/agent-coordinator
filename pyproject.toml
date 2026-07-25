@@ -1,7 +1,7 @@
 [project]
 name = "agent-coordinator"
-version = "0.3.2"
-description = "Durable task ownership, lease, heartbeat, and reclaim coordination for agent loops."
+version = "0.4.0"
+description = "Durable task ownership, lease, heartbeat, reclaim, and human-decision coordination for agent loops."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
