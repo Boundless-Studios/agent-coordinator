@@ -176,6 +176,7 @@ class TaskCoordinator:
         store: JsonlClaimStore,
         *,
         pid_is_live=default_pid_is_live,
+        reclaim_dead_owners: bool = True,
         compaction_event_threshold: int = DEFAULT_COMPACTION_EVENT_THRESHOLD,
         claim_history_retention: timedelta = DEFAULT_CLAIM_HISTORY_RETENTION,
     ):
@@ -185,6 +186,7 @@ class TaskCoordinator:
             raise ValueError("claim_history_retention must not be negative")
         self.store = store
         self.pid_is_live = pid_is_live
+        self.reclaim_dead_owners = reclaim_dead_owners
         self.compaction_event_threshold = compaction_event_threshold
         self.claim_history_retention = claim_history_retention
 
@@ -796,7 +798,7 @@ class TaskCoordinator:
             )
         if timestamp >= claim.lease_expires_at:
             return ClaimDecision(ClaimState.EXPIRED, claim, True, "claim lease expired")
-        if not self.pid_is_live(claim.owner.pid):
+        if self.reclaim_dead_owners and not self.pid_is_live(claim.owner.pid):
             return ClaimDecision(
                 ClaimState.OWNER_DEAD, claim, True, "claim owner process is not live"
             )
