@@ -35,6 +35,7 @@ EXIT_DECISION_PENDING = 6
 EXIT_DECISION_NOT_RESUMABLE = 7
 EXIT_BAD_REQUEST = 8
 EXIT_NOT_FOUND = 9
+STDERR_FILE_DESCRIPTOR = 2
 
 
 def _task_from_args(args: argparse.Namespace) -> TaskIdentity:
@@ -155,7 +156,11 @@ def _cmd_run_with_lease(args: argparse.Namespace) -> int:
         _print({"error": "invalid_lease_run", "detail": str(exc)})
         return EXIT_BAD_REQUEST
 
-    result = run_with_lease(JsonlClaimStore(args.store), request)
+    result = run_with_lease(
+        JsonlClaimStore(args.store),
+        request,
+        child_stdout=STDERR_FILE_DESCRIPTOR,
+    )
     _print(
         {
             "state": result.state.value,
@@ -167,7 +172,7 @@ def _cmd_run_with_lease(args: argparse.Namespace) -> int:
             "release_error": result.release_error,
         }
     )
-    return result.exit_code if 0 <= result.exit_code <= 125 else 1
+    return result.exit_code if 0 <= result.exit_code <= 255 else 1
 
 
 def _parse_option(raw: str) -> DecisionOption:

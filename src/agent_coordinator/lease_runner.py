@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -78,9 +80,12 @@ class LeaseRunRequest:
             raise ValueError("heartbeat_seconds must be positive")
         if self.heartbeat_seconds >= self.lease_seconds:
             raise ValueError("heartbeat_seconds must be lower than lease_seconds")
-        if self.timeout_seconds <= 0:
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
-        if self.terminate_grace_seconds < 0:
+        if (
+            not math.isfinite(self.terminate_grace_seconds)
+            or self.terminate_grace_seconds < 0
+        ):
             raise ValueError("terminate_grace_seconds must not be negative")
         if not self.session_id:
             raise ValueError("session_id is required")
@@ -113,24 +118,45 @@ def _terminate_process_group(
     grace_seconds: float,
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
+    on_wait: Callable[[], None] | None = None,
 ) -> None:
+    callback_error: Exception | None = None
+
+    def process_group_exists() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def wait_callback() -> None:
+        nonlocal callback_error
+        if on_wait is None or callback_error is not None:
+            return
+        try:
+            on_wait()
+        except Exception as exc:
+            callback_error = exc
+
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
     deadline = monotonic() + grace_seconds
-    while process.poll() is None and monotonic() < deadline:
+    while process_group_exists() and monotonic() < deadline:
+        wait_callback()
         sleep(min(0.05, max(0.0, deadline - monotonic())))
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
+    if process_group_exists():
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     try:
         process.wait(timeout=max(1.0, grace_seconds))
     except subprocess.TimeoutExpired:
-        return
+        pass
+    if callback_error is not None:
+        raise callback_error
 
 
 def run_with_lease(
@@ -142,15 +168,18 @@ def run_with_lease(
     sleep: Callable[[float], None] = time.sleep,
     process_factory: Callable[..., ManagedProcess] = subprocess.Popen,
     teardown: Callable[[ManagedProcess, float], None] | None = None,
+    child_stdout: object | None = None,
 ) -> LeaseRunResult:
     """Run a command under an exclusive, heartbeat-backed resource lease."""
 
     coordinator = TaskCoordinator(store, reclaim_dead_owners=False)
+    invocation_session_id = f"{request.session_id}:{uuid.uuid4().hex}"
     owner = OwnerIdentity(
-        session_id=request.session_id,
+        session_id=invocation_session_id,
         pid=os.getpid(),
         agent=request.agent,
         worktree_path=str(request.cwd),
+        metadata={"caller_session_id": request.session_id},
     )
     try:
         claim = coordinator.claim_task(
@@ -182,21 +211,45 @@ def run_with_lease(
     exit_code = 127
     release_reason = "launch_failed"
     release_error = None
-    stop_process = teardown or (
-        lambda child, grace: _terminate_process_group(
+    next_heartbeat: float | None = None
+
+    def heartbeat_if_due() -> None:
+        nonlocal next_heartbeat
+        current = monotonic()
+        if next_heartbeat is None or current < next_heartbeat:
+            return
+        coordinator.heartbeat_claim(
+            claim.claim_id,
+            owner_session_id=invocation_session_id,
+            lease_epoch=claim.lease_epoch,
+            lease_seconds=request.lease_seconds,
+            now=clock(),
+        )
+        next_heartbeat = current + request.heartbeat_seconds
+
+    def stop_process(
+        child: ManagedProcess,
+        grace: float,
+        *,
+        maintain_lease: bool = True,
+    ) -> None:
+        if teardown is not None:
+            teardown(child, grace)
+            return
+        _terminate_process_group(
             child,
             grace,
             monotonic,
             sleep,
+            heartbeat_if_due if maintain_lease else None,
         )
-    )
+
     try:
         try:
-            process = process_factory(
-                request.command,
-                cwd=request.cwd,
-                start_new_session=True,
-            )
+            process_options = {"cwd": request.cwd, "start_new_session": True}
+            if child_stdout is not None:
+                process_options["stdout"] = child_stdout
+            process = process_factory(request.command, **process_options)
         except OSError:
             return LeaseRunResult(
                 state=state,
@@ -223,14 +276,7 @@ def run_with_lease(
                 release_reason = "command_timed_out"
                 break
             if current >= next_heartbeat:
-                coordinator.heartbeat_claim(
-                    claim.claim_id,
-                    owner_session_id=request.session_id,
-                    lease_epoch=claim.lease_epoch,
-                    lease_seconds=request.lease_seconds,
-                    now=clock(),
-                )
-                next_heartbeat = current + request.heartbeat_seconds
+                heartbeat_if_due()
             sleep(
                 min(
                     0.25,
@@ -240,7 +286,11 @@ def run_with_lease(
             )
     except StaleClaimError as exc:
         if process is not None:
-            stop_process(process, request.terminate_grace_seconds)
+            stop_process(
+                process,
+                request.terminate_grace_seconds,
+                maintain_lease=False,
+            )
         state = LeaseRunState.FENCED
         exit_code = 75
         release_reason = "lease_fenced"
@@ -251,16 +301,20 @@ def run_with_lease(
         state = LeaseRunState.INTERRUPTED
         exit_code = 130
         release_reason = "command_interrupted"
+    except Exception:
+        if process is not None:
+            stop_process(process, request.terminate_grace_seconds)
+        raise
     finally:
         try:
             coordinator.release_claim(
                 claim.claim_id,
-                owner_session_id=request.session_id,
+                owner_session_id=invocation_session_id,
                 lease_epoch=claim.lease_epoch,
                 reason=release_reason,
                 now=clock(),
             )
-        except (KeyError, PermissionError, StaleClaimError, ValueError) as exc:
+        except Exception as exc:
             release_error = str(exc)
 
     return LeaseRunResult(

@@ -1,4 +1,6 @@
+import math
 import os
+import signal
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -41,6 +43,10 @@ def request(tmp_path, **changes) -> LeaseRunRequest:
         ("heartbeat_seconds", 0),
         ("timeout_seconds", 0),
         ("terminate_grace_seconds", -1),
+        ("timeout_seconds", math.nan),
+        ("timeout_seconds", math.inf),
+        ("terminate_grace_seconds", math.nan),
+        ("terminate_grace_seconds", math.inf),
         ("session_id", ""),
         ("agent", ""),
     ],
@@ -80,6 +86,38 @@ def test_contention_fails_fast_with_holder_age_and_remediation(tmp_path) -> None
     assert result.holder_age_seconds == 12
     assert "lease expiry" in (result.remediation or "")
     assert launches == 0
+
+
+def test_overlapping_invocations_with_same_session_id_contend(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    class HoldingProcess:
+        pid = os.getpid()
+        returncode = None
+
+        def poll(self):
+            if not attempted_overlap:
+                attempted_overlap.append(
+                    run_with_lease(
+                        store,
+                        request(tmp_path),
+                        process_factory=lambda *_args, **_kwargs: pytest.fail(
+                            "contending invocation must not launch"
+                        ),
+                    )
+                )
+            self.returncode = 0
+            return 0
+
+    attempted_overlap = []
+    first = run_with_lease(
+        store,
+        request(tmp_path),
+        process_factory=lambda *_args, **_kwargs: HoldingProcess(),
+    )
+
+    assert first.state is LeaseRunState.EXITED
+    assert attempted_overlap[0].state is LeaseRunState.CONTENDED
 
 
 @pytest.mark.parametrize("child_exit", [0, 7])
@@ -271,3 +309,123 @@ def test_deposed_runner_terminates_child_when_heartbeat_is_fenced(tmp_path) -> N
     )
     assert decision.claim is not None
     assert decision.claim.owner.session_id == "successor"
+
+
+def test_heartbeat_storage_failure_tears_down_before_propagating(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    elapsed = 0.0
+    torn_down = []
+
+    def sleep(_seconds: float) -> None:
+        nonlocal elapsed
+        elapsed = 2.0
+
+    def fail_heartbeat(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(TaskCoordinator, "heartbeat_claim", fail_heartbeat)
+
+    with pytest.raises(OSError, match="disk full"):
+        run_with_lease(
+            store,
+            request(tmp_path, heartbeat_seconds=1),
+            monotonic=lambda: elapsed,
+            sleep=sleep,
+            process_factory=lambda *_args, **_kwargs: PollingProcess(),
+            teardown=lambda process, grace: torn_down.append((process.pid, grace)),
+        )
+
+    assert torn_down == [(os.getpid(), 0.2)]
+
+
+def test_teardown_escalates_when_leader_exits_but_process_group_survives(
+    monkeypatch,
+) -> None:
+    from agent_coordinator.lease_runner import _terminate_process_group
+
+    signals = []
+
+    def killpg(_pid, sig):
+        if sig != 0:
+            signals.append(sig)
+
+    class ExitedLeader:
+        pid = 1234
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    elapsed = 0.0
+
+    def monotonic():
+        return elapsed
+
+    def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    _terminate_process_group(ExitedLeader(), 0.1, monotonic, sleep)
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_teardown_heartbeats_while_waiting_for_process_group(tmp_path, monkeypatch) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    elapsed = 0.0
+    heartbeat_times = []
+    original_heartbeat = TaskCoordinator.heartbeat_claim
+
+    class StubbornProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    def monotonic():
+        return elapsed
+
+    def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    def killpg(_pid, sig):
+        if sig == 0 and elapsed >= 4:
+            raise ProcessLookupError
+
+    def heartbeat(self, *args, **kwargs):
+        heartbeat_times.append(elapsed)
+        return original_heartbeat(self, *args, **kwargs)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(TaskCoordinator, "heartbeat_claim", heartbeat)
+
+    result = run_with_lease(
+        store,
+        request(
+            tmp_path,
+            lease_seconds=3,
+            heartbeat_seconds=1,
+            timeout_seconds=0.5,
+            terminate_grace_seconds=4,
+        ),
+        clock=lambda: BASE_TIME + timedelta(seconds=elapsed),
+        monotonic=monotonic,
+        sleep=sleep,
+        process_factory=lambda *_args, **_kwargs: StubbornProcess(),
+    )
+
+    assert result.state is LeaseRunState.TIMED_OUT
+    assert len(heartbeat_times) >= 3

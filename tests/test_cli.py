@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 
+import pytest
+
 from agent_coordinator import JsonlClaimStore, OwnerIdentity, TaskCoordinator
 from agent_coordinator.cli import main
 from agent_coordinator.lease_runner import LeaseKey, canonical_worktree_resource
@@ -66,6 +68,47 @@ def test_cli_run_with_lease_preserves_child_exit_and_releases(tmp_path, capsys):
         ).task_identity()
     )
     assert decision.reclaimable is True
+
+
+def test_cli_run_with_lease_keeps_child_stdout_out_of_json(tmp_path, capfd):
+    store = tmp_path / "claims.jsonl"
+
+    code = main(
+        lease_run_args(
+            tmp_path,
+            store,
+            sys.executable,
+            "-c",
+            "print('child-output')",
+        )
+    )
+    captured = capfd.readouterr()
+
+    assert code == 0
+    assert json.loads(captured.out)["state"] == "exited"
+    assert "child-output" not in captured.out
+    assert "child-output" in captured.err
+
+
+@pytest.mark.parametrize("child_exit", [126, 130, 255])
+def test_cli_run_with_lease_preserves_representable_exit_codes(
+    tmp_path,
+    capsys,
+    child_exit,
+):
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            f"raise SystemExit({child_exit})",
+        ),
+        capsys,
+    )
+
+    assert payload["exit_code"] == child_exit
+    assert code == child_exit
 
 
 def test_cli_run_with_lease_reports_contending_holder(tmp_path, capsys):
