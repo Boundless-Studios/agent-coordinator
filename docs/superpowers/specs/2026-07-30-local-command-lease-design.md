@@ -1,6 +1,6 @@
 # Local Command Lease Design
 
-**Issue:** BOU-2710  
+**Issue:** BOU-2710
 **Destination:** `agent-coordinator`, followed by a separate thin Gaia adapter
 
 ## Goal
