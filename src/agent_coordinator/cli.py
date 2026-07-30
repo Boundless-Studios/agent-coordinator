@@ -7,6 +7,12 @@ import json
 from pathlib import Path
 import sys
 
+from .lease_runner import (
+    LeaseKey,
+    LeaseRunRequest,
+    canonical_worktree_resource,
+    run_with_lease,
+)
 from .models import DecisionOption, DecisionState, OwnerIdentity, TaskIdentity
 from .service import (
     ClaimConflictError,
@@ -126,6 +132,42 @@ def _cmd_reclaimable(args: argparse.Namespace) -> int:
     decision = _coordinator(args).status(_task_from_args(args))
     _print(decision.to_dict())
     return EXIT_OK if decision.reclaimable else 1
+
+
+def _cmd_run_with_lease(args: argparse.Namespace) -> int:
+    command = tuple(args.child_command)
+    if command and command[0] == "--":
+        command = command[1:]
+    try:
+        resource_key = canonical_worktree_resource(args.worktree_path)
+        request = LeaseRunRequest(
+            key=LeaseKey(args.namespace, resource_key),
+            command=command,
+            cwd=Path(resource_key),
+            lease_seconds=args.lease_seconds,
+            heartbeat_seconds=args.heartbeat_seconds,
+            timeout_seconds=args.timeout_seconds,
+            terminate_grace_seconds=args.terminate_grace_seconds,
+            session_id=args.session_id,
+            agent=args.agent,
+        )
+    except (OSError, ValueError) as exc:
+        _print({"error": "invalid_lease_run", "detail": str(exc)})
+        return EXIT_BAD_REQUEST
+
+    result = run_with_lease(JsonlClaimStore(args.store), request)
+    _print(
+        {
+            "state": result.state.value,
+            "exit_code": result.exit_code,
+            "claim": result.claim.to_dict() if result.claim else None,
+            "holder": result.holder.to_dict() if result.holder else None,
+            "holder_age_seconds": result.holder_age_seconds,
+            "remediation": result.remediation,
+            "release_error": result.release_error,
+        }
+    )
+    return result.exit_code if 0 <= result.exit_code <= 125 else 1
 
 
 def _parse_option(raw: str) -> DecisionOption:
@@ -325,6 +367,30 @@ def build_parser() -> argparse.ArgumentParser:
     reclaimable = subparsers.add_parser("reclaimable")
     add_task_args(reclaimable)
     reclaimable.set_defaults(func=_cmd_reclaimable)
+
+    run_with_lease_parser = subparsers.add_parser(
+        "run-with-lease",
+        help="Run one local command under an exclusive fenced resource lease.",
+    )
+    add_store_arg(run_with_lease_parser)
+    run_with_lease_parser.add_argument("--namespace", required=True)
+    run_with_lease_parser.add_argument("--worktree-path", required=True)
+    run_with_lease_parser.add_argument("--session-id", required=True)
+    run_with_lease_parser.add_argument("--agent", default="unknown")
+    run_with_lease_parser.add_argument("--lease-seconds", type=int, default=120)
+    run_with_lease_parser.add_argument("--heartbeat-seconds", type=int, default=20)
+    run_with_lease_parser.add_argument("--timeout-seconds", type=float, default=900)
+    run_with_lease_parser.add_argument(
+        "--terminate-grace-seconds",
+        type=float,
+        default=10,
+    )
+    run_with_lease_parser.add_argument(
+        "child_command",
+        nargs=argparse.REMAINDER,
+        help="Command to run, conventionally after --.",
+    )
+    run_with_lease_parser.set_defaults(func=_cmd_run_with_lease)
 
     decision_request = subparsers.add_parser(
         "decision-request",

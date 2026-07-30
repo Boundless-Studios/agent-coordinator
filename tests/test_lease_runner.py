@@ -221,3 +221,53 @@ def test_long_command_heartbeats_before_lease_expiry(tmp_path) -> None:
 
     event_types = [event["event"] for event in store.read_events()]
     assert "heartbeat" in event_types
+
+
+def test_deposed_runner_terminates_child_when_heartbeat_is_fenced(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    elapsed = 0.0
+    successor_claimed = False
+    torn_down = []
+
+    def clock() -> datetime:
+        return BASE_TIME + timedelta(seconds=elapsed)
+
+    def monotonic() -> float:
+        nonlocal successor_claimed
+        if elapsed >= 3 and not successor_claimed:
+            TaskCoordinator(store, reclaim_dead_owners=False).claim_task(
+                LeaseKey("local-frontend-test", str(tmp_path)).task_identity(),
+                OwnerIdentity(session_id="successor", pid=9999, agent="pytest"),
+                lease_seconds=30,
+                now=clock(),
+            )
+            successor_claimed = True
+        return elapsed
+
+    def sleep(_seconds: float) -> None:
+        nonlocal elapsed
+        elapsed = 3.0
+
+    result = run_with_lease(
+        store,
+        request(
+            tmp_path,
+            lease_seconds=2,
+            heartbeat_seconds=1,
+        ),
+        clock=clock,
+        monotonic=monotonic,
+        sleep=sleep,
+        process_factory=lambda *_args, **_kwargs: PollingProcess(),
+        teardown=lambda process, grace: torn_down.append((process.pid, grace)),
+    )
+
+    assert result.state is LeaseRunState.FENCED
+    assert result.exit_code != 0
+    assert torn_down == [(os.getpid(), 0.2)]
+    decision = TaskCoordinator(store, reclaim_dead_owners=False).status(
+        LeaseKey("local-frontend-test", str(tmp_path)).task_identity(),
+        now=clock(),
+    )
+    assert decision.claim is not None
+    assert decision.claim.owner.session_id == "successor"

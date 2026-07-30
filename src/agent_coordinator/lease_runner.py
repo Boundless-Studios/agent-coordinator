@@ -54,6 +54,7 @@ class LeaseRunState(str, Enum):
     INTERRUPTED = "interrupted"
     CONTENDED = "contended"
     LAUNCH_FAILED = "launch_failed"
+    FENCED = "fenced"
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,13 @@ def run_with_lease(
                     max(0.0, next_heartbeat - current),
                 )
             )
+    except StaleClaimError as exc:
+        if process is not None:
+            stop_process(process, request.terminate_grace_seconds)
+        state = LeaseRunState.FENCED
+        exit_code = 75
+        release_reason = "lease_fenced"
+        release_error = str(exc)
     except KeyboardInterrupt:
         if process is not None:
             stop_process(process, request.terminate_grace_seconds)
