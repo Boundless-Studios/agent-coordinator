@@ -260,24 +260,32 @@ def run_with_lease(
             ),
         )
     except KeyboardInterrupt:
-        decision = coordinator.status(request.key.task_identity())
-        interrupted_claim = decision.claim
-        if (
-            interrupted_claim is not None
-            and interrupted_claim.owner.session_id == invocation_session_id
-            and interrupted_claim.status == "active"
-        ):
-            interrupted_claim = coordinator.release_claim(
-                interrupted_claim.claim_id,
-                owner_session_id=invocation_session_id,
-                lease_epoch=interrupted_claim.lease_epoch,
-                reason="acquisition_interrupted",
-                now=clock() if clock is not None else None,
-            )
+        interrupted_claim = None
+        cleanup_error = None
+        try:
+            decision = coordinator.status(request.key.task_identity())
+            interrupted_claim = decision.claim
+            if (
+                interrupted_claim is not None
+                and interrupted_claim.owner.session_id == invocation_session_id
+                and interrupted_claim.status == "active"
+            ):
+                interrupted_claim = coordinator.release_claim(
+                    interrupted_claim.claim_id,
+                    owner_session_id=invocation_session_id,
+                    lease_epoch=interrupted_claim.lease_epoch,
+                    reason="acquisition_interrupted",
+                    now=clock() if clock is not None else None,
+                )
+        except KeyboardInterrupt:
+            cleanup_error = "acquisition cleanup was interrupted"
+        except Exception as exc:
+            cleanup_error = str(exc)
         return LeaseRunResult(
             state=LeaseRunState.INTERRUPTED,
             exit_code=130,
             claim=interrupted_claim,
+            release_error=cleanup_error,
         )
 
     process: ManagedProcess | None = None
@@ -293,6 +301,7 @@ def run_with_lease(
     parent_guard_fd: int | None = None
     guard_status_fd: int | None = None
     guard_spawn_succeeded: bool | None = None
+    guard_authorized = False
 
     def heartbeat_if_due(*, force: bool = False) -> None:
         nonlocal claim, next_heartbeat, next_heartbeat_wall
@@ -325,6 +334,8 @@ def run_with_lease(
         next_heartbeat_wall = claim.heartbeat_at + timedelta(
             seconds=request.heartbeat_seconds
         )
+        if guard_authorized and parent_guard_fd is not None:
+            os.write(parent_guard_fd, b"K")
 
     def stop_process(
         child: ManagedProcess,
@@ -335,9 +346,14 @@ def run_with_lease(
         if teardown is not None:
             teardown(child, grace)
             return
+        outer_grace = (
+            grace + GUARD_CRASH_OVERHEAD_SECONDS
+            if process_factory is None
+            else grace
+        )
         _terminate_process_group(
             child,
-            grace,
+            outer_grace,
             monotonic,
             sleep,
             heartbeat_if_due if maintain_lease else None,
@@ -390,6 +406,8 @@ def run_with_lease(
                     str(guard_status_write_fd),
                     "--grace-seconds",
                     str(request.terminate_grace_seconds),
+                    "--keepalive-timeout",
+                    str(request.lease_seconds - request.heartbeat_seconds),
                     "--",
                     *request.command,
                 )
@@ -416,6 +434,8 @@ def run_with_lease(
             heartbeat_if_due(force=True)
             if parent_guard_fd is not None:
                 os.write(parent_guard_fd, b"A")
+                guard_authorized = True
+            spawn_timed_out = False
             if guard_status_fd is not None:
                 while True:
                     readable, _, _ = select.select(
@@ -430,8 +450,20 @@ def run_with_lease(
                             raise OSError("process guard closed without spawn status")
                         guard_spawn_succeeded = status == b"S"
                         break
+                    current = monotonic()
+                    if current >= deadline or current_time() >= deadline_wall:
+                        if not stop_process_safely(
+                            process,
+                            request.terminate_grace_seconds,
+                        ):
+                            break
+                        state = LeaseRunState.TIMED_OUT
+                        exit_code = 124
+                        release_reason = "command_timed_out"
+                        spawn_timed_out = True
+                        break
                     heartbeat_if_due()
-            while True:
+            while not spawn_timed_out:
                 if (
                     next_heartbeat_wall is not None
                     and current_time() >= next_heartbeat_wall
@@ -439,10 +471,18 @@ def run_with_lease(
                     heartbeat_if_due(force=True)
                 child_exit = process.poll()
                 if child_exit is not None:
-                    if not stop_process_safely(
-                        process,
-                        request.terminate_grace_seconds,
-                    ):
+                    if process_factory is not None:
+                        if not stop_process_safely(
+                            process,
+                            request.terminate_grace_seconds,
+                        ):
+                            break
+                    if process_factory is None and child_exit == 76:
+                        record_teardown_failure(
+                            ProcessTeardownError(
+                                "guard could not confirm child process group stopped"
+                            )
+                        )
                         break
                     state = (
                         LeaseRunState.LAUNCH_FAILED

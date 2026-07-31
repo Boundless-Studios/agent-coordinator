@@ -147,6 +147,28 @@ def test_interrupt_after_acquisition_releases_unlaunched_claim(
     assert result.claim.release_reason == "acquisition_interrupted"
 
 
+def test_repeated_interrupt_during_acquisition_cleanup_is_structured(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    def interrupt_claim(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    def interrupt_status(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(TaskCoordinator, "claim_task", interrupt_claim)
+    monkeypatch.setattr(TaskCoordinator, "status", interrupt_status)
+
+    result = run_with_lease(store, request(tmp_path))
+
+    assert result.state is LeaseRunState.INTERRUPTED
+    assert result.exit_code == 130
+    assert result.release_error == "acquisition cleanup was interrupted"
+
+
 @pytest.mark.parametrize("child_exit", [0, 7])
 def test_child_exit_is_preserved_and_lease_is_released(
     tmp_path,
@@ -316,12 +338,6 @@ def test_spawn_failure_reports_a_release_storage_error(
 
 def test_timeout_terminates_process_group_and_releases(tmp_path) -> None:
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
-    launched = []
-
-    def launch(*args, **kwargs):
-        process = subprocess.Popen(*args, **kwargs)
-        launched.append(process)
-        return process
 
     result = run_with_lease(
         store,
@@ -336,12 +352,10 @@ def test_timeout_terminates_process_group_and_releases(tmp_path) -> None:
             timeout_seconds=0.05,
             terminate_grace_seconds=0.1,
         ),
-        process_factory=launch,
     )
 
     assert result.state is LeaseRunState.TIMED_OUT
     assert result.exit_code != 0
-    assert launched[0].returncode is not None
     assert result.claim is not None
     assert TaskCoordinator(store).status(result.claim.task).reclaimable is True
 
@@ -1080,6 +1094,8 @@ def test_process_guard_kills_child_when_wrapper_pipe_closes(tmp_path) -> None:
             str(status_write_fd),
             "--grace-seconds",
             "0.1",
+            "--keepalive-timeout",
+            "5",
             "--",
             sys.executable,
             "-c",
