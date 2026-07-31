@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
@@ -77,6 +77,10 @@ class LeaseRunRequest:
             raise ValueError("command is required")
         if self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        try:
+            datetime.now(timezone.utc) + timedelta(seconds=self.lease_seconds)
+        except OverflowError as exc:
+            raise ValueError("lease_seconds is too large") from exc
         if self.heartbeat_seconds <= 0:
             raise ValueError("heartbeat_seconds must be positive")
         if self.heartbeat_seconds >= self.lease_seconds:
@@ -186,7 +190,7 @@ def run_with_lease(
     store: JsonlClaimStore,
     request: LeaseRunRequest,
     *,
-    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    clock: Callable[[], datetime] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     process_factory: Callable[..., ManagedProcess] = subprocess.Popen,
@@ -196,6 +200,7 @@ def run_with_lease(
     """Run a command under an exclusive, heartbeat-backed resource lease."""
 
     coordinator = TaskCoordinator(store, reclaim_dead_owners=False)
+    current_time = clock or (lambda: datetime.now(timezone.utc))
     invocation_session_id = f"{request.session_id}:{uuid.uuid4().hex}"
     owner = OwnerIdentity(
         session_id=invocation_session_id,
@@ -209,12 +214,12 @@ def run_with_lease(
             request.key.task_identity(),
             owner,
             lease_seconds=request.lease_seconds,
-            now=clock(),
+            now=clock() if clock is not None else None,
         )
     except ClaimConflictError as exc:
         holder = exc.decision.claim
         age = (
-            max(0.0, (clock() - holder.claimed_at).total_seconds())
+            max(0.0, (current_time() - holder.claimed_at).total_seconds())
             if holder is not None
             else None
         )
@@ -250,7 +255,7 @@ def run_with_lease(
                 owner_session_id=invocation_session_id,
                 lease_epoch=claim.lease_epoch,
                 lease_seconds=request.lease_seconds,
-                now=clock(),
+                now=clock() if clock is not None else None,
             )
         except Exception:
             remaining_margin = request.lease_seconds - request.heartbeat_seconds
@@ -283,6 +288,24 @@ def run_with_lease(
         teardown_error = str(exc)
         release_on_exit = False
 
+    def stop_process_safely(
+        child: ManagedProcess,
+        grace: float,
+        *,
+        maintain_lease: bool = True,
+    ) -> bool:
+        try:
+            stop_process(child, grace, maintain_lease=maintain_lease)
+        except ProcessTeardownError as exc:
+            record_teardown_failure(exc)
+            return False
+        except KeyboardInterrupt:
+            record_teardown_failure(
+                ProcessTeardownError("process teardown was interrupted")
+            )
+            return False
+        return True
+
     try:
         try:
             process_options = {"cwd": request.cwd, "start_new_session": True}
@@ -299,10 +322,10 @@ def run_with_lease(
             while True:
                 child_exit = process.poll()
                 if child_exit is not None:
-                    try:
-                        stop_process(process, request.terminate_grace_seconds)
-                    except ProcessTeardownError as exc:
-                        record_teardown_failure(exc)
+                    if not stop_process_safely(
+                        process,
+                        request.terminate_grace_seconds,
+                    ):
                         break
                     state = LeaseRunState.EXITED
                     exit_code = child_exit
@@ -311,10 +334,10 @@ def run_with_lease(
 
                 current = monotonic()
                 if current >= deadline:
-                    try:
-                        stop_process(process, request.terminate_grace_seconds)
-                    except ProcessTeardownError as exc:
-                        record_teardown_failure(exc)
+                    if not stop_process_safely(
+                        process,
+                        request.terminate_grace_seconds,
+                    ):
                         break
                     state = LeaseRunState.TIMED_OUT
                     exit_code = 124
@@ -331,14 +354,11 @@ def run_with_lease(
                 )
     except StaleClaimError as exc:
         if process is not None:
-            try:
-                stop_process(
-                    process,
-                    request.terminate_grace_seconds,
-                    maintain_lease=False,
-                )
-            except ProcessTeardownError as teardown_exc:
-                record_teardown_failure(teardown_exc)
+            stop_process_safely(
+                process,
+                request.terminate_grace_seconds,
+                maintain_lease=False,
+            )
         if state is not LeaseRunState.TEARDOWN_FAILED:
             state = LeaseRunState.FENCED
             exit_code = 75
@@ -346,21 +366,15 @@ def run_with_lease(
             release_error = str(exc)
     except KeyboardInterrupt:
         if process is not None:
-            try:
-                stop_process(process, request.terminate_grace_seconds)
-            except ProcessTeardownError as exc:
-                record_teardown_failure(exc)
+            stop_process_safely(process, request.terminate_grace_seconds)
         if state is not LeaseRunState.TEARDOWN_FAILED:
             state = LeaseRunState.INTERRUPTED
             exit_code = 130
             release_reason = "command_interrupted"
     except Exception as exc:
         if process is not None:
-            try:
-                stop_process(process, request.terminate_grace_seconds)
-            except ProcessTeardownError as teardown_exc:
-                record_teardown_failure(teardown_exc)
-                raise teardown_exc from exc
+            if not stop_process_safely(process, request.terminate_grace_seconds):
+                raise ProcessTeardownError(teardown_error or "") from exc
         raise
     finally:
         if release_on_exit:
@@ -370,7 +384,7 @@ def run_with_lease(
                     owner_session_id=invocation_session_id,
                     lease_epoch=claim.lease_epoch,
                     reason=release_reason,
-                    now=clock(),
+                    now=clock() if clock is not None else None,
                 )
             except Exception as exc:
                 release_error = str(exc)

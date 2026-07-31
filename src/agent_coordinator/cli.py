@@ -153,7 +153,7 @@ def _cmd_run_with_lease(args: argparse.Namespace) -> int:
             session_id=args.session_id,
             agent=args.agent,
         )
-    except (OSError, ValueError) as exc:
+    except (KeyError, OSError, OverflowError, ValueError) as exc:
         _print({"error": "invalid_lease_run", "detail": str(exc)})
         return EXIT_BAD_REQUEST
 
@@ -163,7 +163,7 @@ def _cmd_run_with_lease(args: argparse.Namespace) -> int:
             request,
             child_stdout=STDERR_FILE_DESCRIPTOR,
         )
-    except (OSError, ValueError) as exc:
+    except (KeyError, OSError, OverflowError, ValueError) as exc:
         _print({"error": "lease_operation_failed", "detail": str(exc)})
         return EXIT_LEASE_OPERATION_FAILED
     _print(

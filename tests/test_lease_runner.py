@@ -41,6 +41,7 @@ def request(tmp_path, **changes) -> LeaseRunRequest:
     [
         ("command", ()),
         ("lease_seconds", 0),
+        ("lease_seconds", 10**20),
         ("heartbeat_seconds", 0),
         ("timeout_seconds", 0),
         ("terminate_grace_seconds", -1),
@@ -546,6 +547,29 @@ def test_teardown_failure_keeps_claim_until_lease_expiry(tmp_path) -> None:
     assert result.state.value == "teardown_failed"
     assert result.exit_code != 0
     assert result.teardown_error == "process group 1234 survived SIGKILL"
+    assert result.claim is not None
+    decision = TaskCoordinator(store, reclaim_dead_owners=False).status(
+        result.claim.task
+    )
+    assert decision.claim is not None
+    assert decision.claim.status == "active"
+
+
+def test_repeated_interrupt_during_cleanup_keeps_claim_active(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    def interrupt_teardown(_process, _grace):
+        raise KeyboardInterrupt
+
+    result = run_with_lease(
+        store,
+        request(tmp_path),
+        process_factory=lambda *_args, **_kwargs: InterruptingProcess(),
+        teardown=interrupt_teardown,
+    )
+
+    assert result.state is LeaseRunState.TEARDOWN_FAILED
+    assert result.teardown_error == "process teardown was interrupted"
     assert result.claim is not None
     decision = TaskCoordinator(store, reclaim_dead_owners=False).status(
         result.claim.task
