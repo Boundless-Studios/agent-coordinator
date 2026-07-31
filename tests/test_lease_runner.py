@@ -136,10 +136,37 @@ def test_child_exit_is_preserved_and_lease_is_released(
 
     assert result.state is LeaseRunState.EXITED
     assert result.exit_code == child_exit
+    assert result.claim is not None
+    assert result.claim.release_reason == "command_exited"
     decision = TaskCoordinator(store).status(result.claim.task)
     assert decision.reclaimable is True
     assert decision.claim is not None
     assert decision.claim.release_reason == "command_exited"
+
+
+def test_normal_leader_exit_cleans_up_surviving_process_group(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    torn_down = []
+
+    class ExitedLeader:
+        pid = 987654
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    result = run_with_lease(
+        store,
+        request(tmp_path),
+        process_factory=lambda *_args, **_kwargs: ExitedLeader(),
+        teardown=lambda process, grace: torn_down.append((process.pid, grace)),
+    )
+
+    assert result.state is LeaseRunState.EXITED
+    assert torn_down == [(987654, 0.2)]
 
 
 def test_spawn_failure_releases_the_lease(tmp_path) -> None:
@@ -447,6 +474,48 @@ def test_teardown_keeps_renewing_after_a_transient_callback_error(
         )
 
     assert callback_calls > 1
+
+
+def test_teardown_reaps_responsive_leader_before_waiting_full_grace(
+    monkeypatch,
+) -> None:
+    from agent_coordinator.lease_runner import _terminate_process_group
+
+    signals = []
+    elapsed = 0.0
+    leader_reaped = False
+
+    def killpg(_pid, sent_signal):
+        if sent_signal == 0 and leader_reaped:
+            raise ProcessLookupError
+        if sent_signal != 0:
+            signals.append(sent_signal)
+
+    class ResponsiveProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            nonlocal leader_reaped
+            leader_reaped = True
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode or 0
+
+    def monotonic():
+        return elapsed
+
+    def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    _terminate_process_group(ResponsiveProcess(), 10, monotonic, sleep)
+
+    assert signals == [signal.SIGTERM]
+    assert elapsed < 10
 
 
 def test_teardown_heartbeats_while_waiting_for_process_group(tmp_path, monkeypatch) -> None:

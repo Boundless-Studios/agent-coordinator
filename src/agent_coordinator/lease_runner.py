@@ -144,7 +144,10 @@ def _terminate_process_group(
     except ProcessLookupError:
         return
     deadline = monotonic() + grace_seconds
-    while process_group_exists() and monotonic() < deadline:
+    while monotonic() < deadline:
+        process.poll()
+        if not process_group_exists():
+            break
         wait_callback()
         sleep(min(0.05, max(0.0, deadline - monotonic())))
     if process_group_exists():
@@ -212,6 +215,7 @@ def run_with_lease(
     exit_code = 127
     release_reason = "launch_failed"
     release_error = None
+    result_claim = claim
     next_heartbeat: float | None = None
 
     def heartbeat_if_due() -> None:
@@ -261,6 +265,7 @@ def run_with_lease(
             while True:
                 child_exit = process.poll()
                 if child_exit is not None:
+                    stop_process(process, request.terminate_grace_seconds)
                     state = LeaseRunState.EXITED
                     exit_code = child_exit
                     release_reason = "command_exited"
@@ -305,7 +310,7 @@ def run_with_lease(
         raise
     finally:
         try:
-            coordinator.release_claim(
+            result_claim = coordinator.release_claim(
                 claim.claim_id,
                 owner_session_id=invocation_session_id,
                 lease_epoch=claim.lease_epoch,
@@ -318,6 +323,6 @@ def run_with_lease(
     return LeaseRunResult(
         state=state,
         exit_code=exit_code,
-        claim=claim,
+        claim=result_claim,
         release_error=release_error,
     )
