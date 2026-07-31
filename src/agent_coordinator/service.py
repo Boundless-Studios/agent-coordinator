@@ -176,6 +176,7 @@ class TaskCoordinator:
         store: JsonlClaimStore,
         *,
         pid_is_live=default_pid_is_live,
+        reclaim_dead_owners: bool = True,
         compaction_event_threshold: int = DEFAULT_COMPACTION_EVENT_THRESHOLD,
         claim_history_retention: timedelta = DEFAULT_CLAIM_HISTORY_RETENTION,
     ):
@@ -185,6 +186,7 @@ class TaskCoordinator:
             raise ValueError("claim_history_retention must not be negative")
         self.store = store
         self.pid_is_live = pid_is_live
+        self.reclaim_dead_owners = reclaim_dead_owners
         self.compaction_event_threshold = compaction_event_threshold
         self.claim_history_retention = claim_history_retention
 
@@ -196,11 +198,13 @@ class TaskCoordinator:
         lease_seconds: int,
         now: datetime | None = None,
     ) -> ClaimRecord:
-        timestamp = normalize_datetime(now or self._now())
+        requested_timestamp = normalize_datetime(now) if now is not None else None
+        compaction_timestamp = requested_timestamp or normalize_datetime(self._now())
         result: ClaimRecord | None = None
 
         def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal result
+            timestamp = requested_timestamp or normalize_datetime(self._now())
             claims = self._claims_by_id(events)
             current = self._decision_for_task(task, claims, timestamp)
             if current.state is ClaimState.ACTIVE and current.claim is not None:
@@ -252,7 +256,7 @@ class TaskCoordinator:
                 event["superseded_claim_ids"] = superseded
             return event
 
-        self._transact_event(build_event, timestamp)
+        self._transact_event(build_event, compaction_timestamp)
         if result is None:
             raise RuntimeError("claim transaction did not produce a claim")
         return result
@@ -266,11 +270,13 @@ class TaskCoordinator:
         lease_seconds: int,
         now: datetime | None = None,
     ) -> ClaimRecord:
-        timestamp = normalize_datetime(now or self._now())
+        requested_timestamp = normalize_datetime(now) if now is not None else None
+        compaction_timestamp = requested_timestamp or normalize_datetime(self._now())
         updated: ClaimRecord | None = None
 
         def build_event(events: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal updated
+            timestamp = requested_timestamp or normalize_datetime(self._now())
             claims = self._claims_by_id(events)
             claim = claims.get(claim_id)
             if claim is None:
@@ -301,7 +307,7 @@ class TaskCoordinator:
                 "lease_expires_at": datetime_to_json(updated.lease_expires_at),
             }
 
-        self._transact_event(build_event, timestamp)
+        self._transact_event(build_event, compaction_timestamp)
         if updated is None:
             raise RuntimeError("heartbeat transaction did not produce a claim")
         return updated
@@ -796,7 +802,7 @@ class TaskCoordinator:
             )
         if timestamp >= claim.lease_expires_at:
             return ClaimDecision(ClaimState.EXPIRED, claim, True, "claim lease expired")
-        if not self.pid_is_live(claim.owner.pid):
+        if self.reclaim_dead_owners and not self.pid_is_live(claim.owner.pid):
             return ClaimDecision(
                 ClaimState.OWNER_DEAD, claim, True, "claim owner process is not live"
             )

@@ -66,6 +66,50 @@ followed by a write transaction is a TOCTOU gap, and any pause between the two
 lets a stale owner re-arm. The in-transaction fence is what makes the mutation
 safe.
 
+## Run one local command per resource
+
+*Requires `0.5.0` or newer.*
+
+`run-with-lease` owns acquisition, heartbeat, process-group teardown, and
+fenced release for a local command:
+
+```bash
+agent-coordinator run-with-lease \
+  --namespace local-frontend-test \
+  --worktree-path "$PWD" \
+  --session-id "$$" \
+  --agent developer-shell \
+  --lease-seconds 120 \
+  --heartbeat-seconds 20 \
+  --timeout-seconds 900 \
+  --terminate-grace-seconds 10 \
+  -- npm test -- --run
+```
+
+The worktree path is resolved strictly, so relative and symlink aliases contend
+on one canonical resource. Different worktrees and namespaces remain
+independent; CI should use a distinct namespace and therefore never wait for a
+local run.
+
+Contention exits quickly with JSON containing the current holder, holder age,
+and remediation. Managed commands use conservative lease-only reclaim: a
+dead-looking or PID-reused holder cannot be displaced before expiry. A small
+process guard binds the command group to the wrapper through an inherited pipe,
+so wrapper termination (including SIGKILL) tears down the command before lease
+expiry permits a successor. Fencing also prevents a stale predecessor from
+mutating that successor.
+
+The JSON claim is the post-release snapshot when release succeeds. Store or
+release failures return a nonzero coordinator status even when the child
+succeeded. If TERM/KILL cannot confirm that the complete process group stopped,
+the result is `teardown_failed` and the claim is deliberately left active until
+lease expiry rather than admitting an overlapping successor.
+
+The coordinator does not inspect RSS and does not apply language-specific
+limits. Adapters are responsible for Node heap ceilings, test-runner timeouts,
+and other runtime policy; they should delegate lease ownership and cleanup
+unchanged.
+
 ## Human decisions
 
 *Requires `0.4.0` or newer.*

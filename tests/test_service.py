@@ -96,6 +96,28 @@ def test_heartbeat_extends_existing_claim(tmp_path):
     assert updated.lease_expires_at == BASE_TIME + timedelta(seconds=120)
 
 
+def test_heartbeat_timestamp_is_captured_inside_transaction(tmp_path, monkeypatch):
+    coord = coordinator(tmp_path)
+    claim = coord.claim_task(task(), owner(), lease_seconds=60, now=BASE_TIME)
+    times = iter(
+        (
+            BASE_TIME + timedelta(seconds=10),
+            BASE_TIME + timedelta(seconds=20),
+        )
+    )
+    monkeypatch.setattr(TaskCoordinator, "_now", staticmethod(lambda: next(times)))
+
+    updated = coord.heartbeat_claim(
+        claim.claim_id,
+        owner_session_id="s1",
+        lease_epoch=claim.lease_epoch,
+        lease_seconds=60,
+    )
+
+    assert updated.heartbeat_at == BASE_TIME + timedelta(seconds=20)
+    assert updated.lease_expires_at == BASE_TIME + timedelta(seconds=80)
+
+
 def test_expired_claim_is_reclaimable(tmp_path):
     coord = coordinator(tmp_path)
     coord.claim_task(task(), owner(), lease_seconds=30, now=BASE_TIME)

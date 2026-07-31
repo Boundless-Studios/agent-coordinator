@@ -1,14 +1,312 @@
 from __future__ import annotations
 
 import json
+import sys
 
+import pytest
+
+from agent_coordinator import JsonlClaimStore, OwnerIdentity, TaskCoordinator
 from agent_coordinator.cli import main
+from agent_coordinator.lease_runner import (
+    LeaseKey,
+    LeaseRunResult,
+    LeaseRunState,
+    canonical_worktree_resource,
+)
 
 
 def run_cli(args, capsys) -> tuple[int, dict]:
     code = main(args)
     output = capsys.readouterr().out
     return code, json.loads(output)
+
+
+def lease_run_args(tmp_path, store, *command: str) -> list[str]:
+    return [
+        "run-with-lease",
+        "--store",
+        str(store),
+        "--namespace",
+        "local-frontend-test",
+        "--worktree-path",
+        str(tmp_path),
+        "--session-id",
+        "cli-runner",
+        "--agent",
+        "pytest",
+        "--lease-seconds",
+        "30",
+        "--heartbeat-seconds",
+        "5",
+        "--timeout-seconds",
+        "10",
+        "--terminate-grace-seconds",
+        "0.2",
+        "--",
+        *command,
+    ]
+
+
+def test_cli_parser_errors_are_structured_json(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run-with-lease", "--lease-seconds", "nope"])
+
+    assert exc_info.value.code == 8
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "invalid_request"
+    assert "invalid int value" in payload["detail"]
+
+
+def test_cli_run_with_lease_preserves_child_exit_and_releases(tmp_path, capsys):
+    store = tmp_path / "claims.jsonl"
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            store,
+            sys.executable,
+            "-c",
+            "raise SystemExit(7)",
+        ),
+        capsys,
+    )
+
+    assert code == 7
+    assert payload["state"] == "exited"
+    assert payload["exit_code"] == 7
+    assert payload["claim"]["task"]["task_type"] == "local-frontend-test"
+    assert payload["claim"]["task"]["task_id"] == canonical_worktree_resource(tmp_path)
+    decision = TaskCoordinator(JsonlClaimStore(store)).status(
+        LeaseKey(
+            "local-frontend-test",
+            canonical_worktree_resource(tmp_path),
+        ).task_identity()
+    )
+    assert decision.reclaimable is True
+
+
+def test_cli_run_with_lease_keeps_child_stdout_out_of_json(tmp_path, capfd):
+    store = tmp_path / "claims.jsonl"
+
+    code = main(
+        lease_run_args(
+            tmp_path,
+            store,
+            sys.executable,
+            "-c",
+            "print('child-output')",
+        )
+    )
+    captured = capfd.readouterr()
+
+    assert code == 0
+    assert json.loads(captured.out)["state"] == "exited"
+    assert "child-output" not in captured.out
+    assert "child-output" in captured.err
+
+
+@pytest.mark.parametrize("child_exit", [126, 130, 255])
+def test_cli_run_with_lease_preserves_representable_exit_codes(
+    tmp_path,
+    capsys,
+    child_exit,
+):
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            f"raise SystemExit({child_exit})",
+        ),
+        capsys,
+    )
+
+    assert payload["exit_code"] == child_exit
+    assert code == child_exit
+
+
+def test_cli_run_with_lease_returns_nonzero_when_release_fails(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent_coordinator.cli.run_with_lease",
+        lambda *_args, **_kwargs: LeaseRunResult(
+            state=LeaseRunState.EXITED,
+            exit_code=0,
+            release_error="disk full",
+        ),
+    )
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert payload["exit_code"] == 0
+    assert payload["release_error"] == "disk full"
+    assert code != 0
+
+
+def test_cli_run_with_lease_reports_acquisition_io_error_as_json(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    def fail_acquisition(*_args, **_kwargs):
+        raise OSError("store is unwritable")
+
+    monkeypatch.setattr("agent_coordinator.cli.run_with_lease", fail_acquisition)
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert code != 0
+    assert payload == {
+        "error": "lease_operation_failed",
+        "detail": "store is unwritable",
+    }
+
+
+def test_cli_run_with_lease_reports_malformed_store_as_json(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    def fail_decode(*_args, **_kwargs):
+        raise KeyError("claim")
+
+    monkeypatch.setattr("agent_coordinator.cli.run_with_lease", fail_decode)
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert code != 0
+    assert payload == {
+        "error": "lease_operation_failed",
+        "detail": "'claim'",
+    }
+
+
+def test_cli_run_with_lease_reports_wrong_record_type_as_json(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    def fail_decode(*_args, **_kwargs):
+        raise TypeError("claim must be an object")
+
+    monkeypatch.setattr("agent_coordinator.cli.run_with_lease", fail_decode)
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert code != 0
+    assert payload["error"] == "lease_operation_failed"
+    assert payload["detail"] == "claim must be an object"
+
+
+def test_cli_run_with_lease_reports_contending_holder(tmp_path, capsys):
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    task = LeaseKey(
+        "local-frontend-test",
+        canonical_worktree_resource(tmp_path),
+    ).task_identity()
+    TaskCoordinator(store, reclaim_dead_owners=False).claim_task(
+        task,
+        OwnerIdentity(session_id="holder", pid=4242, agent="vitest"),
+        lease_seconds=60,
+    )
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            store.path,
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert code == 3
+    assert payload["state"] == "contended"
+    assert payload["holder"]["owner"]["session_id"] == "holder"
+    assert payload["holder_age_seconds"] >= 0
+    assert "lease expiry" in payload["remediation"]
+
+
+def test_cli_namespaces_do_not_contend(tmp_path, capsys):
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    TaskCoordinator(store, reclaim_dead_owners=False).claim_task(
+        LeaseKey(
+            "ci-frontend-test",
+            canonical_worktree_resource(tmp_path),
+        ).task_identity(),
+        OwnerIdentity(session_id="ci", pid=4242, agent="ci"),
+        lease_seconds=60,
+    )
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            store.path,
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert code == 0
+    assert payload["state"] == "exited"
+
+
+def test_cli_run_with_lease_rejects_missing_worktree(tmp_path, capsys):
+    args = lease_run_args(
+        tmp_path / "missing",
+        tmp_path / "claims.jsonl",
+        sys.executable,
+        "-c",
+        "raise SystemExit(0)",
+    )
+
+    code, payload = run_cli(args, capsys)
+
+    assert code == 8
+    assert payload["error"] == "invalid_lease_run"
 
 
 def test_cli_claim_status_reclaimable_release_flow(tmp_path, capsys):

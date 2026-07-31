@@ -1,5 +1,13 @@
 """Agent task ownership coordination library."""
 
+from .lease_runner import (
+    LeaseKey,
+    LeaseRunRequest,
+    LeaseRunResult,
+    LeaseRunState,
+    canonical_worktree_resource,
+    run_with_lease,
+)
 from .models import (
     ClaimRecord,
     DecisionOption,
@@ -35,9 +43,15 @@ __all__ = [
     "DecisionResolution",
     "DecisionState",
     "JsonlClaimStore",
+    "LeaseKey",
+    "LeaseRunRequest",
+    "LeaseRunResult",
+    "LeaseRunState",
     "OwnerIdentity",
     "StaleClaimError",
     "StaleDecisionError",
     "TaskCoordinator",
     "TaskIdentity",
+    "canonical_worktree_resource",
+    "run_with_lease",
 ]
