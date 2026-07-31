@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import agent_coordinator.lease_runner as lease_runner
 from agent_coordinator import JsonlClaimStore, OwnerIdentity, TaskCoordinator
 from agent_coordinator.lease_runner import (
     LeaseKey,
@@ -92,7 +93,7 @@ def test_overlapping_invocations_with_same_session_id_contend(tmp_path) -> None:
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
 
     class HoldingProcess:
-        pid = os.getpid()
+        pid = 987654
         returncode = None
 
         def poll(self):
@@ -270,7 +271,7 @@ def test_interrupt_tears_down_and_releases(tmp_path) -> None:
 
 
 class PollingProcess:
-    pid = os.getpid()
+    pid = 987654
     returncode = None
 
     def __init__(self) -> None:
@@ -353,7 +354,7 @@ def test_deposed_runner_terminates_child_when_heartbeat_is_fenced(tmp_path) -> N
 
     assert result.state is LeaseRunState.FENCED
     assert result.exit_code != 0
-    assert torn_down == [(os.getpid(), 0.2)]
+    assert torn_down == [(987654, 0.2)]
     decision = TaskCoordinator(store, reclaim_dead_owners=False).status(
         LeaseKey("local-frontend-test", str(tmp_path)).task_identity(),
         now=clock(),
@@ -389,7 +390,7 @@ def test_heartbeat_storage_failure_tears_down_before_propagating(
             teardown=lambda process, grace: torn_down.append((process.pid, grace)),
         )
 
-    assert torn_down == [(os.getpid(), 0.2)]
+    assert torn_down == [(987654, 0.2)]
 
 
 def test_teardown_escalates_when_leader_exits_but_process_group_survives(
@@ -398,10 +399,16 @@ def test_teardown_escalates_when_leader_exits_but_process_group_survives(
     from agent_coordinator.lease_runner import _terminate_process_group
 
     signals = []
+    killed = False
 
     def killpg(_pid, sig):
+        nonlocal killed
+        if sig == 0 and killed:
+            raise ProcessLookupError
         if sig != 0:
             signals.append(sig)
+        if sig == signal.SIGKILL:
+            killed = True
 
     class ExitedLeader:
         pid = 1234
@@ -435,9 +442,14 @@ def test_teardown_keeps_renewing_after_a_transient_callback_error(
 
     callback_calls = 0
     elapsed = 0.0
+    killed = False
 
-    def killpg(_pid, _signal):
-        return None
+    def killpg(_pid, sent_signal):
+        nonlocal killed
+        if sent_signal == 0 and killed:
+            raise ProcessLookupError
+        if sent_signal == signal.SIGKILL:
+            killed = True
 
     def callback():
         nonlocal callback_calls
@@ -516,6 +528,120 @@ def test_teardown_reaps_responsive_leader_before_waiting_full_grace(
 
     assert signals == [signal.SIGTERM]
     assert elapsed < 10
+
+
+def test_teardown_failure_keeps_claim_until_lease_expiry(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    def fail_teardown(_process, _grace):
+        raise lease_runner.ProcessTeardownError("process group 1234 survived SIGKILL")
+
+    result = run_with_lease(
+        store,
+        request(tmp_path),
+        process_factory=lambda *_args, **_kwargs: InterruptingProcess(),
+        teardown=fail_teardown,
+    )
+
+    assert result.state.value == "teardown_failed"
+    assert result.exit_code != 0
+    assert result.teardown_error == "process group 1234 survived SIGKILL"
+    assert result.claim is not None
+    decision = TaskCoordinator(store, reclaim_dead_owners=False).status(
+        result.claim.task
+    )
+    assert decision.claim is not None
+    assert decision.claim.status == "active"
+
+
+def test_sigkill_survivor_raises_teardown_failure(monkeypatch) -> None:
+    from agent_coordinator.lease_runner import _terminate_process_group
+
+    elapsed = 0.0
+
+    def monotonic():
+        return elapsed
+
+    def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    class UnkillableProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("child", timeout)
+
+    monkeypatch.setattr(os, "killpg", lambda _pid, _signal: None)
+
+    with pytest.raises(
+        lease_runner.ProcessTeardownError,
+        match="survived SIGKILL",
+    ):
+        _terminate_process_group(UnkillableProcess(), 0.1, monotonic, sleep)
+
+
+def test_failed_teardown_heartbeat_retries_inside_remaining_lease_margin(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    elapsed = 0.0
+    attempts = []
+    original_heartbeat = TaskCoordinator.heartbeat_claim
+
+    class StubbornProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    def monotonic():
+        return elapsed
+
+    def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    def killpg(_pid, sig):
+        if sig == 0 and elapsed >= 4:
+            raise ProcessLookupError
+
+    def heartbeat(self, *args, **kwargs):
+        attempts.append(elapsed)
+        if len(attempts) == 1:
+            raise OSError("transient")
+        return original_heartbeat(self, *args, **kwargs)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(TaskCoordinator, "heartbeat_claim", heartbeat)
+
+    with pytest.raises(OSError, match="transient"):
+        run_with_lease(
+            store,
+            request(
+                tmp_path,
+                lease_seconds=3,
+                heartbeat_seconds=2,
+                timeout_seconds=0.5,
+                terminate_grace_seconds=4,
+            ),
+            clock=lambda: BASE_TIME + timedelta(seconds=elapsed),
+            monotonic=monotonic,
+            sleep=sleep,
+            process_factory=lambda *_args, **_kwargs: StubbornProcess(),
+        )
+
+    assert attempts[1] - attempts[0] < 1
 
 
 def test_teardown_heartbeats_while_waiting_for_process_group(tmp_path, monkeypatch) -> None:

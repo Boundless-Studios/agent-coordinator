@@ -35,6 +35,7 @@ EXIT_DECISION_PENDING = 6
 EXIT_DECISION_NOT_RESUMABLE = 7
 EXIT_BAD_REQUEST = 8
 EXIT_NOT_FOUND = 9
+EXIT_LEASE_OPERATION_FAILED = 74
 STDERR_FILE_DESCRIPTOR = 2
 
 
@@ -156,11 +157,15 @@ def _cmd_run_with_lease(args: argparse.Namespace) -> int:
         _print({"error": "invalid_lease_run", "detail": str(exc)})
         return EXIT_BAD_REQUEST
 
-    result = run_with_lease(
-        JsonlClaimStore(args.store),
-        request,
-        child_stdout=STDERR_FILE_DESCRIPTOR,
-    )
+    try:
+        result = run_with_lease(
+            JsonlClaimStore(args.store),
+            request,
+            child_stdout=STDERR_FILE_DESCRIPTOR,
+        )
+    except (OSError, ValueError) as exc:
+        _print({"error": "lease_operation_failed", "detail": str(exc)})
+        return EXIT_LEASE_OPERATION_FAILED
     _print(
         {
             "state": result.state.value,
@@ -170,8 +175,11 @@ def _cmd_run_with_lease(args: argparse.Namespace) -> int:
             "holder_age_seconds": result.holder_age_seconds,
             "remediation": result.remediation,
             "release_error": result.release_error,
+            "teardown_error": result.teardown_error,
         }
     )
+    if result.release_error is not None:
+        return EXIT_LEASE_OPERATION_FAILED
     return result.exit_code if 0 <= result.exit_code <= 255 else 1
 
 

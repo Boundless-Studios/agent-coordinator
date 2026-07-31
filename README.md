@@ -97,6 +97,12 @@ dead-looking or PID-reused holder cannot be displaced before expiry. Wrapper
 crashes stop heartbeats; expiry permits a successor with a higher epoch, and
 fencing prevents the predecessor from mutating that successor.
 
+The JSON claim is the post-release snapshot when release succeeds. Store or
+release failures return a nonzero coordinator status even when the child
+succeeded. If TERM/KILL cannot confirm that the complete process group stopped,
+the result is `teardown_failed` and the claim is deliberately left active until
+lease expiry rather than admitting an overlapping successor.
+
 The coordinator does not inspect RSS and does not apply language-specific
 limits. Adapters are responsible for Node heap ceilings, test-runner timeouts,
 and other runtime policy; they should delegate lease ownership and cleanup

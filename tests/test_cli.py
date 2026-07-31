@@ -7,7 +7,12 @@ import pytest
 
 from agent_coordinator import JsonlClaimStore, OwnerIdentity, TaskCoordinator
 from agent_coordinator.cli import main
-from agent_coordinator.lease_runner import LeaseKey, canonical_worktree_resource
+from agent_coordinator.lease_runner import (
+    LeaseKey,
+    LeaseRunResult,
+    LeaseRunState,
+    canonical_worktree_resource,
+)
 
 
 def run_cli(args, capsys) -> tuple[int, dict]:
@@ -109,6 +114,64 @@ def test_cli_run_with_lease_preserves_representable_exit_codes(
 
     assert payload["exit_code"] == child_exit
     assert code == child_exit
+
+
+def test_cli_run_with_lease_returns_nonzero_when_release_fails(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent_coordinator.cli.run_with_lease",
+        lambda *_args, **_kwargs: LeaseRunResult(
+            state=LeaseRunState.EXITED,
+            exit_code=0,
+            release_error="disk full",
+        ),
+    )
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert payload["exit_code"] == 0
+    assert payload["release_error"] == "disk full"
+    assert code != 0
+
+
+def test_cli_run_with_lease_reports_acquisition_io_error_as_json(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    def fail_acquisition(*_args, **_kwargs):
+        raise OSError("store is unwritable")
+
+    monkeypatch.setattr("agent_coordinator.cli.run_with_lease", fail_acquisition)
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert code != 0
+    assert payload == {
+        "error": "lease_operation_failed",
+        "detail": "store is unwritable",
+    }
 
 
 def test_cli_run_with_lease_reports_contending_holder(tmp_path, capsys):

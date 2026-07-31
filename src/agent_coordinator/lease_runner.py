@@ -57,6 +57,7 @@ class LeaseRunState(str, Enum):
     CONTENDED = "contended"
     LAUNCH_FAILED = "launch_failed"
     FENCED = "fenced"
+    TEARDOWN_FAILED = "teardown_failed"
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ class LeaseRunResult:
     holder_age_seconds: float | None = None
     remediation: str | None = None
     release_error: str | None = None
+    teardown_error: str | None = None
 
 
 class ManagedProcess(Protocol):
@@ -111,6 +113,10 @@ class ManagedProcess(Protocol):
     def poll(self) -> int | None: ...
 
     def wait(self, timeout: float | None = None) -> int: ...
+
+
+class ProcessTeardownError(RuntimeError):
+    """Raised when a managed process group cannot be confirmed stopped."""
 
 
 def _terminate_process_group(
@@ -155,10 +161,23 @@ def _terminate_process_group(
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    kill_deadline = monotonic() + max(1.0, grace_seconds)
+    while monotonic() < kill_deadline:
+        process.poll()
+        if not process_group_exists():
+            break
+        wait_callback()
+        sleep(min(0.05, max(0.0, kill_deadline - monotonic())))
     try:
-        process.wait(timeout=max(1.0, grace_seconds))
-    except subprocess.TimeoutExpired:
-        pass
+        process.wait(timeout=max(0.0, kill_deadline - monotonic()))
+    except subprocess.TimeoutExpired as exc:
+        raise ProcessTeardownError(
+            f"process group {process.pid} survived SIGKILL"
+        ) from exc
+    if process_group_exists():
+        raise ProcessTeardownError(
+            f"process group {process.pid} survived SIGKILL"
+        )
     if callback_error is not None:
         raise callback_error
 
@@ -215,7 +234,9 @@ def run_with_lease(
     exit_code = 127
     release_reason = "launch_failed"
     release_error = None
+    teardown_error = None
     result_claim = claim
+    release_on_exit = True
     next_heartbeat: float | None = None
 
     def heartbeat_if_due() -> None:
@@ -223,14 +244,19 @@ def run_with_lease(
         current = monotonic()
         if next_heartbeat is None or current < next_heartbeat:
             return
+        try:
+            coordinator.heartbeat_claim(
+                claim.claim_id,
+                owner_session_id=invocation_session_id,
+                lease_epoch=claim.lease_epoch,
+                lease_seconds=request.lease_seconds,
+                now=clock(),
+            )
+        except Exception:
+            remaining_margin = request.lease_seconds - request.heartbeat_seconds
+            next_heartbeat = current + min(0.5, remaining_margin / 2)
+            raise
         next_heartbeat = current + request.heartbeat_seconds
-        coordinator.heartbeat_claim(
-            claim.claim_id,
-            owner_session_id=invocation_session_id,
-            lease_epoch=claim.lease_epoch,
-            lease_seconds=request.lease_seconds,
-            now=clock(),
-        )
 
     def stop_process(
         child: ManagedProcess,
@@ -249,6 +275,14 @@ def run_with_lease(
             heartbeat_if_due if maintain_lease else None,
         )
 
+    def record_teardown_failure(exc: ProcessTeardownError) -> None:
+        nonlocal state, exit_code, release_reason, teardown_error, release_on_exit
+        state = LeaseRunState.TEARDOWN_FAILED
+        exit_code = 76
+        release_reason = "process_teardown_failed"
+        teardown_error = str(exc)
+        release_on_exit = False
+
     try:
         try:
             process_options = {"cwd": request.cwd, "start_new_session": True}
@@ -265,7 +299,11 @@ def run_with_lease(
             while True:
                 child_exit = process.poll()
                 if child_exit is not None:
-                    stop_process(process, request.terminate_grace_seconds)
+                    try:
+                        stop_process(process, request.terminate_grace_seconds)
+                    except ProcessTeardownError as exc:
+                        record_teardown_failure(exc)
+                        break
                     state = LeaseRunState.EXITED
                     exit_code = child_exit
                     release_reason = "command_exited"
@@ -273,7 +311,11 @@ def run_with_lease(
 
                 current = monotonic()
                 if current >= deadline:
-                    stop_process(process, request.terminate_grace_seconds)
+                    try:
+                        stop_process(process, request.terminate_grace_seconds)
+                    except ProcessTeardownError as exc:
+                        record_teardown_failure(exc)
+                        break
                     state = LeaseRunState.TIMED_OUT
                     exit_code = 124
                     release_reason = "command_timed_out"
@@ -289,40 +331,54 @@ def run_with_lease(
                 )
     except StaleClaimError as exc:
         if process is not None:
-            stop_process(
-                process,
-                request.terminate_grace_seconds,
-                maintain_lease=False,
-            )
-        state = LeaseRunState.FENCED
-        exit_code = 75
-        release_reason = "lease_fenced"
-        release_error = str(exc)
+            try:
+                stop_process(
+                    process,
+                    request.terminate_grace_seconds,
+                    maintain_lease=False,
+                )
+            except ProcessTeardownError as teardown_exc:
+                record_teardown_failure(teardown_exc)
+        if state is not LeaseRunState.TEARDOWN_FAILED:
+            state = LeaseRunState.FENCED
+            exit_code = 75
+            release_reason = "lease_fenced"
+            release_error = str(exc)
     except KeyboardInterrupt:
         if process is not None:
-            stop_process(process, request.terminate_grace_seconds)
-        state = LeaseRunState.INTERRUPTED
-        exit_code = 130
-        release_reason = "command_interrupted"
-    except Exception:
+            try:
+                stop_process(process, request.terminate_grace_seconds)
+            except ProcessTeardownError as exc:
+                record_teardown_failure(exc)
+        if state is not LeaseRunState.TEARDOWN_FAILED:
+            state = LeaseRunState.INTERRUPTED
+            exit_code = 130
+            release_reason = "command_interrupted"
+    except Exception as exc:
         if process is not None:
-            stop_process(process, request.terminate_grace_seconds)
+            try:
+                stop_process(process, request.terminate_grace_seconds)
+            except ProcessTeardownError as teardown_exc:
+                record_teardown_failure(teardown_exc)
+                raise teardown_exc from exc
         raise
     finally:
-        try:
-            result_claim = coordinator.release_claim(
-                claim.claim_id,
-                owner_session_id=invocation_session_id,
-                lease_epoch=claim.lease_epoch,
-                reason=release_reason,
-                now=clock(),
-            )
-        except Exception as exc:
-            release_error = str(exc)
+        if release_on_exit:
+            try:
+                result_claim = coordinator.release_claim(
+                    claim.claim_id,
+                    owner_session_id=invocation_session_id,
+                    lease_epoch=claim.lease_epoch,
+                    reason=release_reason,
+                    now=clock(),
+                )
+            except Exception as exc:
+                release_error = str(exc)
 
     return LeaseRunResult(
         state=state,
         exit_code=exit_code,
         claim=result_claim,
         release_error=release_error,
+        teardown_error=teardown_error,
     )
