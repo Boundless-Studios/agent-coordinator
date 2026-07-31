@@ -160,6 +160,30 @@ def test_spawn_failure_releases_the_lease(tmp_path) -> None:
     assert TaskCoordinator(store).status(result.claim.task).reclaimable is True
 
 
+def test_spawn_failure_reports_a_release_storage_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    def fail_spawn(*_args, **_kwargs):
+        raise OSError("cannot spawn")
+
+    def fail_release(*_args, **_kwargs):
+        raise OSError("disk full during release")
+
+    monkeypatch.setattr(TaskCoordinator, "release_claim", fail_release)
+
+    result = run_with_lease(
+        store,
+        request(tmp_path),
+        process_factory=fail_spawn,
+    )
+
+    assert result.state is LeaseRunState.LAUNCH_FAILED
+    assert result.release_error == "disk full during release"
+
+
 def test_timeout_terminates_process_group_and_releases(tmp_path) -> None:
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
     launched = []
@@ -375,6 +399,54 @@ def test_teardown_escalates_when_leader_exits_but_process_group_survives(
     _terminate_process_group(ExitedLeader(), 0.1, monotonic, sleep)
 
     assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_teardown_keeps_renewing_after_a_transient_callback_error(
+    monkeypatch,
+) -> None:
+    from agent_coordinator.lease_runner import _terminate_process_group
+
+    callback_calls = 0
+    elapsed = 0.0
+
+    def killpg(_pid, _signal):
+        return None
+
+    def callback():
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls == 1:
+            raise OSError("transient heartbeat failure")
+
+    def monotonic():
+        return elapsed
+
+    def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    class StubbornProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -signal.SIGKILL
+
+    monkeypatch.setattr(os, "killpg", killpg)
+
+    with pytest.raises(OSError, match="transient heartbeat failure"):
+        _terminate_process_group(
+            StubbornProcess(),
+            0.2,
+            monotonic,
+            sleep,
+            callback,
+        )
+
+    assert callback_calls > 1
 
 
 def test_teardown_heartbeats_while_waiting_for_process_group(tmp_path, monkeypatch) -> None:

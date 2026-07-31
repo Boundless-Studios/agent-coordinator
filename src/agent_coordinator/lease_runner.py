@@ -131,12 +131,13 @@ def _terminate_process_group(
 
     def wait_callback() -> None:
         nonlocal callback_error
-        if on_wait is None or callback_error is not None:
+        if on_wait is None:
             return
         try:
             on_wait()
         except Exception as exc:
-            callback_error = exc
+            if callback_error is None:
+                callback_error = exc
 
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -251,39 +252,36 @@ def run_with_lease(
                 process_options["stdout"] = child_stdout
             process = process_factory(request.command, **process_options)
         except OSError:
-            return LeaseRunResult(
-                state=state,
-                exit_code=exit_code,
-                claim=claim,
-            )
+            process = None
 
-        started = monotonic()
-        deadline = started + request.timeout_seconds
-        next_heartbeat = started + request.heartbeat_seconds
-        while True:
-            child_exit = process.poll()
-            if child_exit is not None:
-                state = LeaseRunState.EXITED
-                exit_code = child_exit
-                release_reason = "command_exited"
-                break
+        if process is not None:
+            started = monotonic()
+            deadline = started + request.timeout_seconds
+            next_heartbeat = started + request.heartbeat_seconds
+            while True:
+                child_exit = process.poll()
+                if child_exit is not None:
+                    state = LeaseRunState.EXITED
+                    exit_code = child_exit
+                    release_reason = "command_exited"
+                    break
 
-            current = monotonic()
-            if current >= deadline:
-                stop_process(process, request.terminate_grace_seconds)
-                state = LeaseRunState.TIMED_OUT
-                exit_code = 124
-                release_reason = "command_timed_out"
-                break
-            if current >= next_heartbeat:
-                heartbeat_if_due()
-            sleep(
-                min(
-                    0.25,
-                    max(0.0, deadline - current),
-                    max(0.0, next_heartbeat - current),
+                current = monotonic()
+                if current >= deadline:
+                    stop_process(process, request.terminate_grace_seconds)
+                    state = LeaseRunState.TIMED_OUT
+                    exit_code = 124
+                    release_reason = "command_timed_out"
+                    break
+                if current >= next_heartbeat:
+                    heartbeat_if_due()
+                sleep(
+                    min(
+                        0.25,
+                        max(0.0, deadline - current),
+                        max(0.0, next_heartbeat - current),
+                    )
                 )
-            )
     except StaleClaimError as exc:
         if process is not None:
             stop_process(
