@@ -16,7 +16,11 @@ def test_status_pipe_failure_tears_down_spawned_child(monkeypatch) -> None:
 
     child = Child()
     torn_down = []
-    monkeypatch.setattr(os, "read", lambda _fd, _size: b"A")
+    monkeypatch.setattr(
+        os,
+        "read",
+        lambda _fd, _size: f"A{time.time() + 60}\n".encode(),
+    )
     monkeypatch.setattr(
         os,
         "write",
@@ -80,7 +84,7 @@ def test_keepalive_expiry_stops_child_without_pipe_eof(tmp_path) -> None:
     os.close(parent_read_fd)
     os.close(status_write_fd)
     try:
-        os.write(parent_write_fd, b"A")
+        os.write(parent_write_fd, f"A{time.time() + 60}\n".encode())
         assert os.read(status_read_fd, 1) == b"S"
         guard.wait(timeout=5)
         child_pid = int(child_pid_file.read_text())

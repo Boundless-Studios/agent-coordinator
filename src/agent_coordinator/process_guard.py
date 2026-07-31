@@ -13,6 +13,7 @@ SPAWN_FAILED_EXIT = 127
 APPROVAL_BYTE = b"A"
 SPAWN_SUCCEEDED_BYTE = b"S"
 SPAWN_FAILED_BYTE = b"F"
+TEARDOWN_FAILED_BYTE = b"T"
 PARENT_POLL_SECONDS = 0.1
 TEARDOWN_FAILED_EXIT = 76
 
@@ -26,8 +27,13 @@ def _terminate_child_group(
     try:
         os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
-        child.wait()
+        try:
+            child.wait(timeout=1)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("child leader could not be reaped") from exc
         return
+    except PermissionError as exc:
+        raise RuntimeError("cannot signal child process group") from exc
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         child.poll()
@@ -41,7 +47,12 @@ def _terminate_child_group(
         os.killpg(child.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    child.wait()
+    except PermissionError as exc:
+        raise RuntimeError("cannot signal child process group") from exc
+    try:
+        child.wait(timeout=1)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("child leader survived SIGKILL") from exc
     try:
         os.killpg(child.pid, 0)
     except ProcessLookupError:
@@ -63,18 +74,15 @@ def main(argv: list[str] | None = None) -> int:
     if not command:
         parser.error("command is required")
 
-    if os.read(args.parent_fd, 1) != APPROVAL_BYTE:
+    authorization = os.read(args.parent_fd, 128)
+    if not authorization.startswith(APPROVAL_BYTE):
         return SPAWN_FAILED_EXIT
     try:
-        child = subprocess.Popen(command, start_new_session=True)
-    except OSError:
-        os.write(args.status_fd, SPAWN_FAILED_BYTE)
+        authorization_expires_at = float(authorization[1:].strip())
+    except ValueError:
         return SPAWN_FAILED_EXIT
-    try:
-        os.write(args.status_fd, SPAWN_SUCCEEDED_BYTE)
-    except BrokenPipeError:
-        _terminate_child_group(child, args.grace_seconds)
-        return 128 + signal.SIGTERM
+    if time.time() >= authorization_expires_at:
+        return SPAWN_FAILED_EXIT
 
     terminate_requested = False
 
@@ -84,18 +92,38 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, request_termination)
     keepalive_deadline = time.monotonic() + args.keepalive_timeout
+    try:
+        child = subprocess.Popen(command, start_new_session=True)
+    except OSError:
+        os.write(args.status_fd, SPAWN_FAILED_BYTE)
+        return SPAWN_FAILED_EXIT
+    if terminate_requested or time.time() >= authorization_expires_at:
+        try:
+            _terminate_child_group(child, args.grace_seconds)
+        except RuntimeError:
+            os.write(args.status_fd, TEARDOWN_FAILED_BYTE)
+            return TEARDOWN_FAILED_EXIT
+        return 128 + signal.SIGTERM
+    try:
+        os.write(args.status_fd, SPAWN_SUCCEEDED_BYTE)
+    except BrokenPipeError:
+        _terminate_child_group(child, args.grace_seconds)
+        return 128 + signal.SIGTERM
+
     while True:
         child_exit = child.poll()
         if child_exit is not None:
             try:
                 _terminate_child_group(child, args.grace_seconds)
             except RuntimeError:
+                os.write(args.status_fd, TEARDOWN_FAILED_BYTE)
                 return TEARDOWN_FAILED_EXIT
             return child_exit if child_exit >= 0 else 128 + abs(child_exit)
         if terminate_requested:
             try:
                 _terminate_child_group(child, args.grace_seconds)
             except RuntimeError:
+                os.write(args.status_fd, TEARDOWN_FAILED_BYTE)
                 return TEARDOWN_FAILED_EXIT
             return 128 + signal.SIGTERM
         remaining = keepalive_deadline - time.monotonic()
@@ -103,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 _terminate_child_group(child, args.grace_seconds)
             except RuntimeError:
+                os.write(args.status_fd, TEARDOWN_FAILED_BYTE)
                 return TEARDOWN_FAILED_EXIT
             return 128 + signal.SIGTERM
         readable, _, _ = select.select(
@@ -116,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     _terminate_child_group(child, args.grace_seconds)
                 except RuntimeError:
+                    os.write(args.status_fd, TEARDOWN_FAILED_BYTE)
                     return TEARDOWN_FAILED_EXIT
                 return 128 + signal.SIGTERM
             keepalive_deadline = time.monotonic() + args.keepalive_timeout

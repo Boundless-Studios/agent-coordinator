@@ -88,6 +88,12 @@ class LeaseRunRequest:
             raise ValueError("heartbeat_seconds must be positive")
         if self.heartbeat_seconds >= self.lease_seconds:
             raise ValueError("heartbeat_seconds must be lower than lease_seconds")
+        if self.heartbeat_seconds >= (
+            self.lease_seconds - self.heartbeat_seconds
+        ):
+            raise ValueError(
+                "heartbeat_seconds must be lower than the guard keepalive window"
+            )
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         try:
@@ -262,25 +268,37 @@ def run_with_lease(
     except KeyboardInterrupt:
         interrupted_claim = None
         cleanup_error = None
-        try:
-            decision = coordinator.status(request.key.task_identity())
-            interrupted_claim = decision.claim
-            if (
-                interrupted_claim is not None
-                and interrupted_claim.owner.session_id == invocation_session_id
-                and interrupted_claim.status == "active"
-            ):
-                interrupted_claim = coordinator.release_claim(
-                    interrupted_claim.claim_id,
-                    owner_session_id=invocation_session_id,
-                    lease_epoch=interrupted_claim.lease_epoch,
-                    reason="acquisition_interrupted",
-                    now=clock() if clock is not None else None,
-                )
-        except KeyboardInterrupt:
-            cleanup_error = "acquisition cleanup was interrupted"
-        except Exception as exc:
-            cleanup_error = str(exc)
+        while True:
+            try:
+                interrupted_claim = coordinator.status(
+                    request.key.task_identity()
+                ).claim
+                break
+            except KeyboardInterrupt:
+                continue
+            except Exception as exc:
+                cleanup_error = str(exc)
+                break
+        if (
+            interrupted_claim is not None
+            and interrupted_claim.owner.session_id == invocation_session_id
+            and interrupted_claim.status == "active"
+        ):
+            while True:
+                try:
+                    interrupted_claim = coordinator.release_claim(
+                        interrupted_claim.claim_id,
+                        owner_session_id=invocation_session_id,
+                        lease_epoch=interrupted_claim.lease_epoch,
+                        reason="acquisition_interrupted",
+                        now=clock() if clock is not None else None,
+                    )
+                    break
+                except KeyboardInterrupt:
+                    continue
+                except Exception as exc:
+                    cleanup_error = str(exc)
+                    break
         return LeaseRunResult(
             state=LeaseRunState.INTERRUPTED,
             exit_code=130,
@@ -433,7 +451,14 @@ def run_with_lease(
             )
             heartbeat_if_due(force=True)
             if parent_guard_fd is not None:
-                os.write(parent_guard_fd, b"A")
+                os.write(
+                    parent_guard_fd,
+                    (
+                        "A"
+                        f"{(claim.heartbeat_at + timedelta(seconds=request.lease_seconds)).timestamp()}"
+                        "\n"
+                    ).encode(),
+                )
                 guard_authorized = True
             spawn_timed_out = False
             if guard_status_fd is not None:
@@ -477,7 +502,16 @@ def run_with_lease(
                             request.terminate_grace_seconds,
                         ):
                             break
-                    if process_factory is None and child_exit == 76:
+                    guard_teardown_failed = False
+                    if process_factory is None and guard_status_fd is not None:
+                        os.set_blocking(guard_status_fd, False)
+                        try:
+                            guard_teardown_failed = (
+                                b"T" in os.read(guard_status_fd, 16)
+                            )
+                        except BlockingIOError:
+                            pass
+                    if guard_teardown_failed:
                         record_teardown_failure(
                             ProcessTeardownError(
                                 "guard could not confirm child process group stopped"
@@ -562,6 +596,8 @@ def run_with_lease(
                     reason=release_reason,
                     now=clock() if clock is not None else None,
                 )
+            except KeyboardInterrupt:
+                release_error = "claim release was interrupted"
             except Exception as exc:
                 release_error = str(exc)
 

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import agent_coordinator.lease_runner as lease_runner
+import agent_coordinator.process_guard as process_guard
 from agent_coordinator import JsonlClaimStore, OwnerIdentity, TaskCoordinator
 from agent_coordinator.lease_runner import (
     LeaseKey,
@@ -147,26 +148,46 @@ def test_interrupt_after_acquisition_releases_unlaunched_claim(
     assert result.claim.release_reason == "acquisition_interrupted"
 
 
-def test_repeated_interrupt_during_acquisition_cleanup_is_structured(
+def test_repeated_interrupts_during_acquisition_cleanup_still_release_claim(
     tmp_path,
     monkeypatch,
 ) -> None:
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    original_claim = TaskCoordinator.claim_task
+    original_status = TaskCoordinator.status
+    original_release = TaskCoordinator.release_claim
+    status_interrupts = 2
+    release_interrupts = 2
 
-    def interrupt_claim(*_args, **_kwargs):
+    def interrupt_after_claim(self, *args, **kwargs):
+        original_claim(self, *args, **kwargs)
         raise KeyboardInterrupt
 
-    def interrupt_status(*_args, **_kwargs):
-        raise KeyboardInterrupt
+    def interrupt_status(self, *args, **kwargs):
+        nonlocal status_interrupts
+        if status_interrupts:
+            status_interrupts -= 1
+            raise KeyboardInterrupt
+        return original_status(self, *args, **kwargs)
 
-    monkeypatch.setattr(TaskCoordinator, "claim_task", interrupt_claim)
+    def interrupt_release(self, *args, **kwargs):
+        nonlocal release_interrupts
+        if release_interrupts:
+            release_interrupts -= 1
+            raise KeyboardInterrupt
+        return original_release(self, *args, **kwargs)
+
+    monkeypatch.setattr(TaskCoordinator, "claim_task", interrupt_after_claim)
     monkeypatch.setattr(TaskCoordinator, "status", interrupt_status)
+    monkeypatch.setattr(TaskCoordinator, "release_claim", interrupt_release)
 
     result = run_with_lease(store, request(tmp_path))
 
     assert result.state is LeaseRunState.INTERRUPTED
     assert result.exit_code == 130
-    assert result.release_error == "acquisition cleanup was interrupted"
+    assert result.release_error is None
+    assert result.claim is not None
+    assert result.claim.release_reason == "acquisition_interrupted"
 
 
 @pytest.mark.parametrize("child_exit", [0, 7])
@@ -216,6 +237,21 @@ def test_guarded_child_exit_127_remains_a_command_exit(tmp_path) -> None:
 
     assert result.state is LeaseRunState.EXITED
     assert result.exit_code == 127
+    assert result.claim is not None
+    assert result.claim.release_reason == "command_exited"
+
+
+def test_guarded_child_exit_76_remains_a_command_exit(tmp_path) -> None:
+    result = run_with_lease(
+        JsonlClaimStore(tmp_path / "claims.jsonl"),
+        request(
+            tmp_path,
+            command=(sys.executable, "-c", "raise SystemExit(76)"),
+        ),
+    )
+
+    assert result.state is LeaseRunState.EXITED
+    assert result.exit_code == 76
     assert result.claim is not None
     assert result.claim.release_reason == "command_exited"
 
@@ -549,7 +585,7 @@ def test_deposed_runner_terminates_child_when_heartbeat_is_fenced(tmp_path) -> N
         store,
         request(
             tmp_path,
-            lease_seconds=2,
+            lease_seconds=3,
             heartbeat_seconds=1,
         ),
         clock=clock,
@@ -931,6 +967,25 @@ def test_permission_error_while_signaling_group_is_teardown_failure(
         )
 
 
+def test_guard_reports_unsignalable_child_group_as_teardown_failure(
+    monkeypatch,
+) -> None:
+    class ExitedChild:
+        pid = 1234
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda _pid, _sig: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot signal child process group"):
+        process_guard._terminate_child_group(ExitedChild(), 0.1)
+
+
 def test_failed_teardown_heartbeat_retries_inside_remaining_lease_margin(
     tmp_path,
     monkeypatch,
@@ -1113,7 +1168,7 @@ def test_process_guard_kills_child_when_wrapper_pipe_closes(tmp_path) -> None:
     try:
         time.sleep(0.1)
         assert not child_pid_file.exists()
-        os.write(write_fd, b"A")
+        os.write(write_fd, f"A{time.time() + 60}\n".encode())
         assert os.read(status_read_fd, 1) == b"S"
         for _ in range(100):
             if child_pid_file.exists():
