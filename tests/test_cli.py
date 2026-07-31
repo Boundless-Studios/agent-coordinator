@@ -202,6 +202,32 @@ def test_cli_run_with_lease_reports_malformed_store_as_json(
     }
 
 
+def test_cli_run_with_lease_reports_wrong_record_type_as_json(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    def fail_decode(*_args, **_kwargs):
+        raise TypeError("claim must be an object")
+
+    monkeypatch.setattr("agent_coordinator.cli.run_with_lease", fail_decode)
+
+    code, payload = run_cli(
+        lease_run_args(
+            tmp_path,
+            tmp_path / "claims.jsonl",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ),
+        capsys,
+    )
+
+    assert code != 0
+    assert payload["error"] == "lease_operation_failed"
+    assert payload["detail"] == "claim must be an object"
+
+
 def test_cli_run_with_lease_reports_contending_holder(tmp_path, capsys):
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
     task = LeaseKey(

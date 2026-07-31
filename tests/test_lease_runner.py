@@ -314,6 +314,97 @@ def test_long_command_heartbeats_before_lease_expiry(tmp_path) -> None:
     assert "heartbeat" in event_types
 
 
+def test_wall_clock_resume_renews_before_polling_child_again(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    wall_elapsed = 0.0
+    observations = []
+
+    class SuspendedProcess:
+        pid = 987654
+        returncode = None
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            observations.append(
+                (
+                    "poll",
+                    len(
+                        [
+                            event
+                            for event in store.read_events()
+                            if event["event"] == "heartbeat"
+                        ]
+                    ),
+                )
+            )
+            if self.polls == 2:
+                self.returncode = 0
+                return 0
+            return None
+
+        def wait(self, timeout=None):
+            return self.returncode or 0
+
+    def sleep(_seconds):
+        nonlocal wall_elapsed
+        wall_elapsed = 4.0
+
+    run_with_lease(
+        store,
+        request(tmp_path, lease_seconds=3, heartbeat_seconds=1),
+        clock=lambda: BASE_TIME + timedelta(seconds=wall_elapsed),
+        monotonic=lambda: 0.0,
+        sleep=sleep,
+        process_factory=lambda *_args, **_kwargs: SuspendedProcess(),
+    )
+
+    assert observations[1] == ("poll", 2)
+
+
+def test_delayed_spawn_revalidates_before_polling_child(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    wall_elapsed = 0.0
+    torn_down = []
+
+    class UnpolledProcess:
+        pid = 987654
+        returncode = None
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    process = UnpolledProcess()
+
+    def delayed_spawn(*_args, **_kwargs):
+        nonlocal wall_elapsed
+        wall_elapsed = 4.0
+        TaskCoordinator(store, reclaim_dead_owners=False).claim_task(
+            LeaseKey("local-frontend-test", str(tmp_path)).task_identity(),
+            OwnerIdentity(session_id="successor", pid=9999, agent="pytest"),
+            lease_seconds=30,
+            now=BASE_TIME + timedelta(seconds=wall_elapsed),
+        )
+        return process
+
+    result = run_with_lease(
+        store,
+        request(tmp_path, lease_seconds=3, heartbeat_seconds=1),
+        clock=lambda: BASE_TIME + timedelta(seconds=wall_elapsed),
+        process_factory=delayed_spawn,
+        teardown=lambda child, grace: torn_down.append((child.pid, grace)),
+    )
+
+    assert result.state is LeaseRunState.FENCED
+    assert process.polls == 0
+    assert torn_down == [(987654, 0.2)]
+
+
 def test_deposed_runner_terminates_child_when_heartbeat_is_fenced(tmp_path) -> None:
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
     elapsed = 0.0

@@ -243,14 +243,23 @@ def run_with_lease(
     result_claim = claim
     release_on_exit = True
     next_heartbeat: float | None = None
+    next_heartbeat_wall: datetime | None = None
 
-    def heartbeat_if_due() -> None:
-        nonlocal next_heartbeat
+    def heartbeat_if_due(*, force: bool = False) -> None:
+        nonlocal claim, next_heartbeat, next_heartbeat_wall
         current = monotonic()
-        if next_heartbeat is None or current < next_heartbeat:
+        wall_current = current_time()
+        monotonic_due = (
+            next_heartbeat is not None and current >= next_heartbeat
+        )
+        wall_due = (
+            next_heartbeat_wall is not None
+            and wall_current >= next_heartbeat_wall
+        )
+        if not force and not monotonic_due and not wall_due:
             return
         try:
-            coordinator.heartbeat_claim(
+            claim = coordinator.heartbeat_claim(
                 claim.claim_id,
                 owner_session_id=invocation_session_id,
                 lease_epoch=claim.lease_epoch,
@@ -259,9 +268,14 @@ def run_with_lease(
             )
         except Exception:
             remaining_margin = request.lease_seconds - request.heartbeat_seconds
-            next_heartbeat = current + min(0.5, remaining_margin / 2)
+            retry_seconds = min(0.5, remaining_margin / 2)
+            next_heartbeat = current + retry_seconds
+            next_heartbeat_wall = wall_current + timedelta(seconds=retry_seconds)
             raise
         next_heartbeat = current + request.heartbeat_seconds
+        next_heartbeat_wall = claim.heartbeat_at + timedelta(
+            seconds=request.heartbeat_seconds
+        )
 
     def stop_process(
         child: ManagedProcess,
@@ -319,7 +333,16 @@ def run_with_lease(
             started = monotonic()
             deadline = started + request.timeout_seconds
             next_heartbeat = started + request.heartbeat_seconds
+            next_heartbeat_wall = claim.heartbeat_at + timedelta(
+                seconds=request.heartbeat_seconds
+            )
+            heartbeat_if_due(force=True)
             while True:
+                if (
+                    next_heartbeat_wall is not None
+                    and current_time() >= next_heartbeat_wall
+                ):
+                    heartbeat_if_due(force=True)
                 child_exit = process.poll()
                 if child_exit is not None:
                     if not stop_process_safely(
