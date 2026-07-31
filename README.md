@@ -68,6 +68,8 @@ safe.
 
 ## Run one local command per resource
 
+*Requires `0.5.0` or newer.*
+
 `run-with-lease` owns acquisition, heartbeat, process-group teardown, and
 fenced release for a local command:
 
