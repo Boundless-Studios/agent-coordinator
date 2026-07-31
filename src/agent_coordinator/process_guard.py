@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import select
 import signal
 import subprocess
+import sys
 import time
 
 SPAWN_FAILED_EXIT = 127
@@ -16,6 +18,26 @@ SPAWN_FAILED_BYTE = b"F"
 TEARDOWN_FAILED_BYTE = b"T"
 PARENT_POLL_SECONDS = 0.1
 TEARDOWN_FAILED_EXIT = 76
+
+
+def _adopt_orphaned_descendants() -> None:
+    """Become a Linux child subreaper so killed descendants can be waited."""
+
+    if sys.platform != "linux":
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "could not become child subreaper")
+
+
+def _reap_child_group(group_id: int) -> None:
+    while True:
+        try:
+            waited_pid, _ = os.waitpid(-group_id, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if waited_pid == 0:
+            return
 
 
 def _terminate_child_group(
@@ -31,6 +53,7 @@ def _terminate_child_group(
             child.wait(timeout=1)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("child leader could not be reaped") from exc
+        _reap_child_group(child.pid)
         return
     except PermissionError as exc:
         raise RuntimeError("cannot signal child process group") from exc
@@ -53,6 +76,7 @@ def _terminate_child_group(
         child.wait(timeout=1)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("child leader survived SIGKILL") from exc
+    _reap_child_group(child.pid)
     try:
         os.killpg(child.pid, 0)
     except ProcessLookupError:
@@ -83,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         return SPAWN_FAILED_EXIT
     if time.time() >= authorization_expires_at:
         return SPAWN_FAILED_EXIT
+    _adopt_orphaned_descendants()
 
     terminate_requested = False
 
