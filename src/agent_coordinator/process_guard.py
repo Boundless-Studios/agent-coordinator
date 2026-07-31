@@ -10,6 +10,9 @@ import subprocess
 import sys
 import time
 
+SPAWN_FAILED_EXIT = 127
+APPROVAL_BYTE = b"A"
+
 
 def _terminate_own_process_group(grace_seconds: float) -> None:
     """Terminate every command in this guard's process group."""
@@ -32,10 +35,19 @@ def main(argv: list[str] | None = None) -> int:
     if not command:
         parser.error("command is required")
 
-    child = subprocess.Popen(command)
+    if os.read(args.parent_fd, 1) != APPROVAL_BYTE:
+        return SPAWN_FAILED_EXIT
+    try:
+        child = subprocess.Popen(command)
+    except OSError:
+        return SPAWN_FAILED_EXIT
     while True:
         if child.poll() is not None:
-            return child.returncode
+            return (
+                child.returncode
+                if child.returncode >= 0
+                else 128 + abs(child.returncode)
+            )
         readable, _, _ = select.select([args.parent_fd], [], [], 0.1)
         if readable and not os.read(args.parent_fd, 1):
             _terminate_own_process_group(args.grace_seconds)

@@ -88,11 +88,21 @@ class LeaseRunRequest:
             raise ValueError("heartbeat_seconds must be lower than lease_seconds")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        try:
+            datetime.now(timezone.utc) + timedelta(seconds=self.timeout_seconds)
+        except OverflowError as exc:
+            raise ValueError("timeout_seconds is too large") from exc
         if (
             not math.isfinite(self.terminate_grace_seconds)
             or self.terminate_grace_seconds < 0
         ):
             raise ValueError("terminate_grace_seconds must not be negative")
+        if self.terminate_grace_seconds >= (
+            self.lease_seconds - self.heartbeat_seconds
+        ):
+            raise ValueError(
+                "terminate_grace_seconds must be lower than the lease renewal margin"
+            )
         if not self.session_id:
             raise ValueError("session_id is required")
         if not self.agent:
@@ -138,6 +148,10 @@ def _terminate_process_group(
             os.killpg(process.pid, 0)
         except ProcessLookupError:
             return False
+        except PermissionError as exc:
+            raise ProcessTeardownError(
+                f"cannot confirm process group {process.pid} stopped"
+            ) from exc
         return True
 
     def wait_callback() -> None:
@@ -352,8 +366,7 @@ def run_with_lease(
                 process_options["pass_fds"] = (guard_read_fd,)
                 guard_command = (
                     sys.executable,
-                    "-m",
-                    "agent_coordinator.process_guard",
+                    str(Path(__file__).with_name("process_guard.py")),
                     "--parent-fd",
                     str(guard_read_fd),
                     "--grace-seconds",
@@ -381,6 +394,8 @@ def run_with_lease(
                 seconds=request.heartbeat_seconds
             )
             heartbeat_if_due(force=True)
+            if parent_guard_fd is not None:
+                os.write(parent_guard_fd, b"A")
             while True:
                 if (
                     next_heartbeat_wall is not None
@@ -394,9 +409,17 @@ def run_with_lease(
                         request.terminate_grace_seconds,
                     ):
                         break
-                    state = LeaseRunState.EXITED
+                    state = (
+                        LeaseRunState.LAUNCH_FAILED
+                        if process_factory is None and child_exit == 127
+                        else LeaseRunState.EXITED
+                    )
                     exit_code = child_exit
-                    release_reason = "command_exited"
+                    release_reason = (
+                        "launch_failed"
+                        if state is LeaseRunState.LAUNCH_FAILED
+                        else "command_exited"
+                    )
                     break
 
                 current = monotonic()
