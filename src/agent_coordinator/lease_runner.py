@@ -223,6 +223,7 @@ def run_with_lease(
         current = monotonic()
         if next_heartbeat is None or current < next_heartbeat:
             return
+        next_heartbeat = current + request.heartbeat_seconds
         coordinator.heartbeat_claim(
             claim.claim_id,
             owner_session_id=invocation_session_id,
@@ -230,7 +231,6 @@ def run_with_lease(
             lease_seconds=request.lease_seconds,
             now=clock(),
         )
-        next_heartbeat = current + request.heartbeat_seconds
 
     def stop_process(
         child: ManagedProcess,
