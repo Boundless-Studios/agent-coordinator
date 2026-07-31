@@ -93,9 +93,11 @@ local run.
 
 Contention exits quickly with JSON containing the current holder, holder age,
 and remediation. Managed commands use conservative lease-only reclaim: a
-dead-looking or PID-reused holder cannot be displaced before expiry. Wrapper
-crashes stop heartbeats; expiry permits a successor with a higher epoch, and
-fencing prevents the predecessor from mutating that successor.
+dead-looking or PID-reused holder cannot be displaced before expiry. A small
+process guard binds the command group to the wrapper through an inherited pipe,
+so wrapper termination (including SIGKILL) tears down the command before lease
+expiry permits a successor. Fencing also prevents a stale predecessor from
+mutating that successor.
 
 The JSON claim is the post-release snapshot when release succeeds. Store or
 release failures return a nonzero coordinator status even when the child

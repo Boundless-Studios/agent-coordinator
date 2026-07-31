@@ -6,6 +6,7 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -193,7 +194,7 @@ def run_with_lease(
     clock: Callable[[], datetime] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
-    process_factory: Callable[..., ManagedProcess] = subprocess.Popen,
+    process_factory: Callable[..., ManagedProcess] | None = None,
     teardown: Callable[[ManagedProcess, float], None] | None = None,
     child_stdout: object | None = None,
 ) -> LeaseRunResult:
@@ -233,6 +234,26 @@ def run_with_lease(
                 "wait for lease expiry"
             ),
         )
+    except KeyboardInterrupt:
+        decision = coordinator.status(request.key.task_identity())
+        interrupted_claim = decision.claim
+        if (
+            interrupted_claim is not None
+            and interrupted_claim.owner.session_id == invocation_session_id
+            and interrupted_claim.status == "active"
+        ):
+            interrupted_claim = coordinator.release_claim(
+                interrupted_claim.claim_id,
+                owner_session_id=invocation_session_id,
+                lease_epoch=interrupted_claim.lease_epoch,
+                reason="acquisition_interrupted",
+                now=clock() if clock is not None else None,
+            )
+        return LeaseRunResult(
+            state=LeaseRunState.INTERRUPTED,
+            exit_code=130,
+            claim=interrupted_claim,
+        )
 
     process: ManagedProcess | None = None
     state = LeaseRunState.LAUNCH_FAILED
@@ -244,6 +265,7 @@ def run_with_lease(
     release_on_exit = True
     next_heartbeat: float | None = None
     next_heartbeat_wall: datetime | None = None
+    parent_guard_fd: int | None = None
 
     def heartbeat_if_due(*, force: bool = False) -> None:
         nonlocal claim, next_heartbeat, next_heartbeat_wall
@@ -325,13 +347,35 @@ def run_with_lease(
             process_options = {"cwd": request.cwd, "start_new_session": True}
             if child_stdout is not None:
                 process_options["stdout"] = child_stdout
-            process = process_factory(request.command, **process_options)
+            if process_factory is None:
+                guard_read_fd, parent_guard_fd = os.pipe()
+                process_options["pass_fds"] = (guard_read_fd,)
+                guard_command = (
+                    sys.executable,
+                    "-m",
+                    "agent_coordinator.process_guard",
+                    "--parent-fd",
+                    str(guard_read_fd),
+                    "--grace-seconds",
+                    str(request.terminate_grace_seconds),
+                    "--",
+                    *request.command,
+                )
+                try:
+                    process = subprocess.Popen(guard_command, **process_options)
+                finally:
+                    os.close(guard_read_fd)
+            else:
+                process = process_factory(request.command, **process_options)
         except OSError:
             process = None
 
         if process is not None:
             started = monotonic()
             deadline = started + request.timeout_seconds
+            deadline_wall = current_time() + timedelta(
+                seconds=request.timeout_seconds
+            )
             next_heartbeat = started + request.heartbeat_seconds
             next_heartbeat_wall = claim.heartbeat_at + timedelta(
                 seconds=request.heartbeat_seconds
@@ -356,7 +400,7 @@ def run_with_lease(
                     break
 
                 current = monotonic()
-                if current >= deadline:
+                if current >= deadline or current_time() >= deadline_wall:
                     if not stop_process_safely(
                         process,
                         request.terminate_grace_seconds,
@@ -396,10 +440,18 @@ def run_with_lease(
             release_reason = "command_interrupted"
     except Exception as exc:
         if process is not None:
+            release_reason = "post_launch_operation_failed"
             if not stop_process_safely(process, request.terminate_grace_seconds):
-                raise ProcessTeardownError(teardown_error or "") from exc
+                return LeaseRunResult(
+                    state=state,
+                    exit_code=exit_code,
+                    claim=result_claim,
+                    teardown_error=teardown_error,
+                )
         raise
     finally:
+        if parent_guard_fd is not None:
+            os.close(parent_guard_fd)
         if release_on_exit:
             try:
                 result_claim = coordinator.release_claim(

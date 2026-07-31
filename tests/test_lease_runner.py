@@ -3,6 +3,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -120,6 +121,27 @@ def test_overlapping_invocations_with_same_session_id_contend(tmp_path) -> None:
 
     assert first.state is LeaseRunState.EXITED
     assert attempted_overlap[0].state is LeaseRunState.CONTENDED
+
+
+def test_interrupt_after_acquisition_releases_unlaunched_claim(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    original_claim = TaskCoordinator.claim_task
+
+    def interrupt_after_claim(self, *args, **kwargs):
+        original_claim(self, *args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(TaskCoordinator, "claim_task", interrupt_after_claim)
+
+    result = run_with_lease(store, request(tmp_path))
+
+    assert result.state is LeaseRunState.INTERRUPTED
+    assert result.exit_code == 130
+    assert result.claim is not None
+    assert result.claim.release_reason == "acquisition_interrupted"
 
 
 @pytest.mark.parametrize("child_exit", [0, 7])
@@ -646,6 +668,58 @@ def test_teardown_failure_keeps_claim_until_lease_expiry(tmp_path) -> None:
     assert decision.claim.status == "active"
 
 
+def test_post_launch_error_returns_teardown_failure_instead_of_raising(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    def fail_heartbeat(*_args, **_kwargs):
+        raise OSError("ledger unavailable")
+
+    def fail_teardown(_process, _grace):
+        raise lease_runner.ProcessTeardownError("child survived")
+
+    monkeypatch.setattr(TaskCoordinator, "heartbeat_claim", fail_heartbeat)
+    result = run_with_lease(
+        store,
+        request(tmp_path),
+        process_factory=lambda *_args, **_kwargs: InterruptingProcess(),
+        teardown=fail_teardown,
+    )
+
+    assert result.state is LeaseRunState.TEARDOWN_FAILED
+    assert result.exit_code == 76
+    assert result.teardown_error == "child survived"
+    assert result.claim is not None
+    assert result.claim.status == "active"
+
+
+def test_post_launch_error_records_distinct_release_reason(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+
+    def fail_heartbeat(*_args, **_kwargs):
+        raise OSError("ledger unavailable")
+
+    monkeypatch.setattr(TaskCoordinator, "heartbeat_claim", fail_heartbeat)
+    with pytest.raises(OSError, match="ledger unavailable"):
+        run_with_lease(
+            store,
+            request(tmp_path),
+            process_factory=lambda *_args, **_kwargs: InterruptingProcess(),
+            teardown=lambda *_args: None,
+        )
+
+    decision = TaskCoordinator(store, reclaim_dead_owners=False).status(
+        request(tmp_path).key.task_identity()
+    )
+    assert decision.claim is not None
+    assert decision.claim.release_reason == "post_launch_operation_failed"
+
+
 def test_repeated_interrupt_during_cleanup_keeps_claim_active(tmp_path) -> None:
     store = JsonlClaimStore(tmp_path / "claims.jsonl")
 
@@ -811,3 +885,84 @@ def test_teardown_heartbeats_while_waiting_for_process_group(tmp_path, monkeypat
 
     assert result.state is LeaseRunState.TIMED_OUT
     assert len(heartbeat_times) >= 3
+
+
+def test_wall_clock_timeout_includes_system_suspend(tmp_path) -> None:
+    store = JsonlClaimStore(tmp_path / "claims.jsonl")
+    wall_elapsed = 0.0
+    torn_down = []
+
+    class RunningProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def sleep(seconds):
+        nonlocal wall_elapsed
+        wall_elapsed += seconds
+
+    result = run_with_lease(
+        store,
+        request(
+            tmp_path,
+            lease_seconds=30,
+            heartbeat_seconds=5,
+            timeout_seconds=1,
+        ),
+        clock=lambda: BASE_TIME + timedelta(seconds=wall_elapsed),
+        monotonic=lambda: 0,
+        sleep=sleep,
+        process_factory=lambda *_args, **_kwargs: RunningProcess(),
+        teardown=lambda process, grace: torn_down.append((process.pid, grace)),
+    )
+
+    assert result.state is LeaseRunState.TIMED_OUT
+    assert torn_down == [(1234, 0.2)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_process_guard_kills_child_when_wrapper_pipe_closes(tmp_path) -> None:
+    child_pid_file = tmp_path / "child.pid"
+    read_fd, write_fd = os.pipe()
+    guard = subprocess.Popen(
+        (
+            sys.executable,
+            "-m",
+            "agent_coordinator.process_guard",
+            "--parent-fd",
+            str(read_fd),
+            "--grace-seconds",
+            "0.1",
+            "--",
+            sys.executable,
+            "-c",
+            (
+                "import os,time,pathlib;"
+                f"pathlib.Path({str(child_pid_file)!r}).write_text(str(os.getpid()));"
+                "time.sleep(60)"
+            ),
+        ),
+        pass_fds=(read_fd,),
+        start_new_session=True,
+    )
+    os.close(read_fd)
+    try:
+        for _ in range(100):
+            if child_pid_file.exists():
+                break
+            time.sleep(0.01)
+        child_pid = int(child_pid_file.read_text())
+        os.close(write_fd)
+        guard.wait(timeout=5)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if guard.poll() is None:
+            os.killpg(guard.pid, signal.SIGKILL)
+        if write_fd >= 0:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass

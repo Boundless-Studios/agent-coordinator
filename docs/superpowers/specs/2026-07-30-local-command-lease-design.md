@@ -151,8 +151,8 @@ Resource ceilings are supplied to the launched runtime by the adapter.
 - Timeout uses a dedicated nonzero CLI exit.
 - Interrupt returns the conventional interrupt exit code after teardown and
   release.
-- Wrapper crash cannot run cleanup; heartbeat stops and expiry/fencing provide
-  recovery.
+- Wrapper crash closes the guard pipe, causing the surviving process guard to
+  terminate the command group; heartbeat expiry/fencing then provides recovery.
 
 ## Verification
 
