@@ -47,6 +47,16 @@ def lease_run_args(tmp_path, store, *command: str) -> list[str]:
     ]
 
 
+def test_cli_parser_errors_are_structured_json(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run-with-lease", "--lease-seconds", "nope"])
+
+    assert exc_info.value.code == 8
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "invalid_request"
+    assert "invalid int value" in payload["detail"]
+
+
 def test_cli_run_with_lease_preserves_child_exit_and_releases(tmp_path, capsys):
     store = tmp_path / "claims.jsonl"
 

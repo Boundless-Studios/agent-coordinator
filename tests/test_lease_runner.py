@@ -52,7 +52,7 @@ def request(tmp_path, **changes) -> LeaseRunRequest:
         ("timeout_seconds", 1e20),
         ("terminate_grace_seconds", math.nan),
         ("terminate_grace_seconds", math.inf),
-        ("terminate_grace_seconds", 25),
+        ("terminate_grace_seconds", 24.9),
         ("session_id", ""),
         ("agent", ""),
     ],
@@ -183,6 +183,21 @@ def test_guarded_spawn_failure_is_reported_as_launch_failure(tmp_path) -> None:
     assert result.claim.release_reason == "launch_failed"
 
 
+def test_guarded_child_exit_127_remains_a_command_exit(tmp_path) -> None:
+    result = run_with_lease(
+        JsonlClaimStore(tmp_path / "claims.jsonl"),
+        request(
+            tmp_path,
+            command=(sys.executable, "-c", "raise SystemExit(127)"),
+        ),
+    )
+
+    assert result.state is LeaseRunState.EXITED
+    assert result.exit_code == 127
+    assert result.claim is not None
+    assert result.claim.release_reason == "command_exited"
+
+
 def test_guard_converts_child_signal_to_conventional_exit_code(tmp_path) -> None:
     result = run_with_lease(
         JsonlClaimStore(tmp_path / "claims.jsonl"),
@@ -223,6 +238,38 @@ def test_normal_leader_exit_cleans_up_surviving_process_group(tmp_path) -> None:
 
     assert result.state is LeaseRunState.EXITED
     assert torn_down == [(987654, 0.2)]
+
+
+def test_guard_cleans_background_group_members_before_exiting(tmp_path) -> None:
+    background_pid_file = tmp_path / "background.pid"
+    result = run_with_lease(
+        JsonlClaimStore(tmp_path / "claims.jsonl"),
+        request(
+            tmp_path,
+            command=(
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,subprocess,sys;"
+                    "child=subprocess.Popen([sys.executable,'-c','import time;"
+                    "time.sleep(60)']);"
+                    f"pathlib.Path({str(background_pid_file)!r}).write_text("
+                    "str(child.pid))"
+                ),
+            ),
+        ),
+    )
+
+    assert result.state is LeaseRunState.EXITED
+    background_pid = int(background_pid_file.read_text())
+    for _ in range(100):
+        try:
+            os.kill(background_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("background process survived the guard")
 
 
 def test_spawn_failure_releases_the_lease(tmp_path) -> None:
@@ -838,6 +885,38 @@ def test_permission_error_while_probing_group_is_teardown_failure(
         )
 
 
+def test_permission_error_while_signaling_group_is_teardown_failure(
+    monkeypatch,
+) -> None:
+    from agent_coordinator.lease_runner import _terminate_process_group
+
+    class UnsignalableProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda _pid, _sig: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+    with pytest.raises(
+        lease_runner.ProcessTeardownError,
+        match="cannot signal",
+    ):
+        _terminate_process_group(
+            UnsignalableProcess(),
+            0.1,
+            lambda: 0,
+            lambda _seconds: None,
+        )
+
+
 def test_failed_teardown_heartbeat_retries_inside_remaining_lease_margin(
     tmp_path,
     monkeypatch,
@@ -990,12 +1069,15 @@ def test_wall_clock_timeout_includes_system_suspend(tmp_path) -> None:
 def test_process_guard_kills_child_when_wrapper_pipe_closes(tmp_path) -> None:
     child_pid_file = tmp_path / "child.pid"
     read_fd, write_fd = os.pipe()
+    status_read_fd, status_write_fd = os.pipe()
     guard = subprocess.Popen(
         (
             sys.executable,
             str(Path(lease_runner.__file__).with_name("process_guard.py")),
             "--parent-fd",
             str(read_fd),
+            "--status-fd",
+            str(status_write_fd),
             "--grace-seconds",
             "0.1",
             "--",
@@ -1007,14 +1089,16 @@ def test_process_guard_kills_child_when_wrapper_pipe_closes(tmp_path) -> None:
                 "time.sleep(60)"
             ),
         ),
-        pass_fds=(read_fd,),
+        pass_fds=(read_fd, status_write_fd),
         start_new_session=True,
     )
     os.close(read_fd)
+    os.close(status_write_fd)
     try:
         time.sleep(0.1)
         assert not child_pid_file.exists()
         os.write(write_fd, b"A")
+        assert os.read(status_read_fd, 1) == b"S"
         for _ in range(100):
             if child_pid_file.exists():
                 break
@@ -1025,6 +1109,7 @@ def test_process_guard_kills_child_when_wrapper_pipe_closes(tmp_path) -> None:
         with pytest.raises(ProcessLookupError):
             os.kill(child_pid, 0)
     finally:
+        os.close(status_read_fd)
         if guard.poll() is None:
             os.killpg(guard.pid, signal.SIGKILL)
         if write_fd >= 0:

@@ -7,27 +7,46 @@ import os
 import select
 import signal
 import subprocess
-import sys
 import time
 
 SPAWN_FAILED_EXIT = 127
 APPROVAL_BYTE = b"A"
+SPAWN_SUCCEEDED_BYTE = b"S"
+SPAWN_FAILED_BYTE = b"F"
+PARENT_POLL_SECONDS = 0.1
 
 
-def _terminate_own_process_group(grace_seconds: float) -> None:
-    """Terminate every command in this guard's process group."""
+def _terminate_child_group(
+    child: subprocess.Popen[bytes],
+    grace_seconds: float,
+) -> None:
+    """Stop the child group while keeping the guard alive to reap its leader."""
 
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    os.killpg(os.getpgrp(), signal.SIGTERM)
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        child.wait()
+        return
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
-        time.sleep(0.05)
-    os.killpg(os.getpgrp(), signal.SIGKILL)
+        child.poll()
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            child.wait()
+            return
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    child.wait()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--parent-fd", type=int, required=True)
+    parser.add_argument("--status-fd", type=int, required=True)
     parser.add_argument("--grace-seconds", type=float, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -38,19 +57,36 @@ def main(argv: list[str] | None = None) -> int:
     if os.read(args.parent_fd, 1) != APPROVAL_BYTE:
         return SPAWN_FAILED_EXIT
     try:
-        child = subprocess.Popen(command)
+        child = subprocess.Popen(command, start_new_session=True)
     except OSError:
+        os.write(args.status_fd, SPAWN_FAILED_BYTE)
         return SPAWN_FAILED_EXIT
+    os.write(args.status_fd, SPAWN_SUCCEEDED_BYTE)
+
+    terminate_requested = False
+
+    def request_termination(_signum: int, _frame: object) -> None:
+        nonlocal terminate_requested
+        terminate_requested = True
+
+    signal.signal(signal.SIGTERM, request_termination)
     while True:
-        if child.poll() is not None:
-            return (
-                child.returncode
-                if child.returncode >= 0
-                else 128 + abs(child.returncode)
-            )
-        readable, _, _ = select.select([args.parent_fd], [], [], 0.1)
+        child_exit = child.poll()
+        if child_exit is not None:
+            _terminate_child_group(child, args.grace_seconds)
+            return child_exit if child_exit >= 0 else 128 + abs(child_exit)
+        if terminate_requested:
+            _terminate_child_group(child, args.grace_seconds)
+            return 128 + signal.SIGTERM
+        readable, _, _ = select.select(
+            [args.parent_fd],
+            [],
+            [],
+            PARENT_POLL_SECONDS,
+        )
         if readable and not os.read(args.parent_fd, 1):
-            _terminate_own_process_group(args.grace_seconds)
+            _terminate_child_group(child, args.grace_seconds)
+            return 128 + signal.SIGTERM
 
 
 if __name__ == "__main__":

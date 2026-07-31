@@ -39,6 +39,14 @@ EXIT_LEASE_OPERATION_FAILED = 74
 STDERR_FILE_DESCRIPTOR = 2
 
 
+class StructuredArgumentParser(argparse.ArgumentParser):
+    """Emit machine-readable bad-request errors for CLI parse failures."""
+
+    def error(self, message: str) -> None:
+        _print({"error": "invalid_request", "detail": message})
+        self.exit(EXIT_BAD_REQUEST)
+
+
 def _task_from_args(args: argparse.Namespace) -> TaskIdentity:
     return TaskIdentity(
         task_type=args.task_type,
@@ -332,7 +340,7 @@ def _cmd_task_resume(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agent-coordinator")
+    parser = StructuredArgumentParser(prog="agent-coordinator")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_store_arg(subparser: argparse.ArgumentParser) -> None:

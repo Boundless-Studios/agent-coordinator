@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from .store import JsonlClaimStore
 
 
 LEASE_FINGERPRINT = "exclusive-resource-lease:v1"
+GUARD_CRASH_OVERHEAD_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -97,8 +99,9 @@ class LeaseRunRequest:
             or self.terminate_grace_seconds < 0
         ):
             raise ValueError("terminate_grace_seconds must not be negative")
-        if self.terminate_grace_seconds >= (
-            self.lease_seconds - self.heartbeat_seconds
+        if (
+            self.terminate_grace_seconds + GUARD_CRASH_OVERHEAD_SECONDS
+            >= self.lease_seconds - self.heartbeat_seconds
         ):
             raise ValueError(
                 "terminate_grace_seconds must be lower than the lease renewal margin"
@@ -168,6 +171,10 @@ def _terminate_process_group(
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError as exc:
+        raise ProcessTeardownError(
+            f"cannot signal process group {process.pid}"
+        ) from exc
     deadline = monotonic() + grace_seconds
     while monotonic() < deadline:
         process.poll()
@@ -180,6 +187,10 @@ def _terminate_process_group(
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError as exc:
+            raise ProcessTeardownError(
+                f"cannot signal process group {process.pid}"
+            ) from exc
     kill_deadline = monotonic() + max(1.0, grace_seconds)
     while monotonic() < kill_deadline:
         process.poll()
@@ -280,6 +291,8 @@ def run_with_lease(
     next_heartbeat: float | None = None
     next_heartbeat_wall: datetime | None = None
     parent_guard_fd: int | None = None
+    guard_status_fd: int | None = None
+    guard_spawn_succeeded: bool | None = None
 
     def heartbeat_if_due(*, force: bool = False) -> None:
         nonlocal claim, next_heartbeat, next_heartbeat_wall
@@ -363,12 +376,18 @@ def run_with_lease(
                 process_options["stdout"] = child_stdout
             if process_factory is None:
                 guard_read_fd, parent_guard_fd = os.pipe()
-                process_options["pass_fds"] = (guard_read_fd,)
+                guard_status_fd, guard_status_write_fd = os.pipe()
+                process_options["pass_fds"] = (
+                    guard_read_fd,
+                    guard_status_write_fd,
+                )
                 guard_command = (
                     sys.executable,
                     str(Path(__file__).with_name("process_guard.py")),
                     "--parent-fd",
                     str(guard_read_fd),
+                    "--status-fd",
+                    str(guard_status_write_fd),
                     "--grace-seconds",
                     str(request.terminate_grace_seconds),
                     "--",
@@ -378,6 +397,7 @@ def run_with_lease(
                     process = subprocess.Popen(guard_command, **process_options)
                 finally:
                     os.close(guard_read_fd)
+                    os.close(guard_status_write_fd)
             else:
                 process = process_factory(request.command, **process_options)
         except OSError:
@@ -396,6 +416,21 @@ def run_with_lease(
             heartbeat_if_due(force=True)
             if parent_guard_fd is not None:
                 os.write(parent_guard_fd, b"A")
+            if guard_status_fd is not None:
+                while True:
+                    readable, _, _ = select.select(
+                        [guard_status_fd],
+                        [],
+                        [],
+                        0.1,
+                    )
+                    if readable:
+                        status = os.read(guard_status_fd, 1)
+                        if status not in {b"S", b"F"}:
+                            raise OSError("process guard closed without spawn status")
+                        guard_spawn_succeeded = status == b"S"
+                        break
+                    heartbeat_if_due()
             while True:
                 if (
                     next_heartbeat_wall is not None
@@ -411,7 +446,8 @@ def run_with_lease(
                         break
                     state = (
                         LeaseRunState.LAUNCH_FAILED
-                        if process_factory is None and child_exit == 127
+                        if process_factory is None
+                        and guard_spawn_succeeded is False
                         else LeaseRunState.EXITED
                     )
                     exit_code = child_exit
@@ -475,6 +511,8 @@ def run_with_lease(
     finally:
         if parent_guard_fd is not None:
             os.close(parent_guard_fd)
+        if guard_status_fd is not None:
+            os.close(guard_status_fd)
         if release_on_exit:
             try:
                 result_claim = coordinator.release_claim(
